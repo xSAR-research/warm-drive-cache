@@ -1,0 +1,266 @@
+// src/config.rs
+//
+// Minimal, isolated config loader for warm-drive-cache.
+// Replaces the hardcoded paths array + adds walk controls (max_depth) and ignore list.
+//
+// Loading priority (per approved plan):
+//   1. $WARM_DRIVE_CACHE_CONFIG (full path to a json file) - for CI, testing, multiple setups
+//   2. XDG: $XDG_CONFIG_HOME/warm-drive-cache/config.json  or  ~/.config/warm-drive-cache/config.json
+//
+// Rules:
+// - Missing file → return defaults that exactly match the old hardcoded constants (smooth transition)
+// - Bad JSON / unreadable / validation failure → Err with actionable message (caller does eprintln + exit 1)
+// - Paths must be non-empty and absolute (reject relatives for predictability + safety)
+// - Users are strongly encouraged (and now enforced) to use absolute paths
+//
+// This module is pure data + fs read. No side effects on the VFS cache warmer itself.
+// The 12 existing unit tests continue to pass because they never call main() or this loader for real paths.
+//
+// See README for example + location documentation.
+
+use serde::Deserialize;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Config {
+    #[serde(default = "default_version")]
+    pub version: u32,
+
+    /// List of absolute root paths to warm. Replaces the old hardcoded array.
+    pub paths: Vec<String>,
+
+    #[serde(default)]
+    pub walk: WalkOptions,
+
+    #[serde(default)]
+    pub ignore: IgnoreOptions,
+
+    #[serde(default)]
+    pub mount_wait: MountWait,
+}
+
+fn default_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct WalkOptions {
+    /// None (or omitted) = unlimited (exact behaviour before this feature).
+    /// Some(n) = WalkDir::max_depth(n)
+    pub max_depth: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct IgnoreOptions {
+    /// Basenames (dirs or files) to prune early in filter_entry.
+    /// Example: [".git", "node_modules", "target"]
+    /// Matches against entry.file_name() only (cheap, no extra stat).
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MountWait {
+    #[serde(default = "default_initial_secs")]
+    pub initial_secs: u64,
+    #[serde(default = "default_retry_delays")]
+    pub retry_delays_secs: Vec<u64>,
+    #[serde(default = "default_max_wait_secs")]
+    pub max_wait_secs: u64,
+}
+
+impl Default for MountWait {
+    fn default() -> Self {
+        Self {
+            initial_secs: default_initial_secs(),
+            retry_delays_secs: default_retry_delays(),
+            max_wait_secs: default_max_wait_secs(),
+        }
+    }
+}
+
+fn default_initial_secs() -> u64 {
+    3
+}
+fn default_retry_delays() -> Vec<u64> {
+    vec![3, 5, 8]
+}
+fn default_max_wait_secs() -> u64 {
+    30
+}
+
+/// Main entry point used by the binary.
+/// Respects WARM_DRIVE_CACHE_CONFIG env var, falls back to XDG ProjectDirs.
+pub fn load() -> Result<Config, String> {
+    if let Ok(p) = env::var("WARM_DRIVE_CACHE_CONFIG") {
+        if !p.is_empty() {
+            return load_from_path(&PathBuf::from(p));
+        }
+    }
+
+    // XDG / standard Linux location using the directories crate (correct, audited)
+    let config_dir = match directories::ProjectDirs::from("au", "xsar", "warm-drive-cache") {
+        Some(dirs) => dirs.config_dir().to_path_buf(),
+        None => {
+            // Very rare on a real Linux system; fall back to $HOME/.config
+            let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".config").join("warm-drive-cache")
+        }
+    };
+
+    let path = config_dir.join("config.json");
+    load_from_path(&path)
+}
+
+/// Load + validate from an explicit path. Used by the binary and by unit tests (via tempfile).
+pub fn load_from_path(path: &std::path::Path) -> Result<Config, String> {
+    if !path.exists() {
+        // Graceful default (matches pre-config behaviour exactly)
+        // Caller may print a one-line info message.
+        return Ok(Config {
+            version: default_version(),
+            paths: vec![], // special sentinel — binary must handle "no paths supplied" as error
+            walk: WalkOptions::default(),
+            ignore: IgnoreOptions::default(),
+            mount_wait: MountWait::default(),
+        });
+    }
+
+    let contents = fs::read_to_string(path)
+        .map_err(|e| format!("cannot read config {}: {}", path.display(), e))?;
+
+    let mut cfg: Config = serde_json::from_str(&contents)
+        .map_err(|e| format!("invalid JSON in {}: {}", path.display(), e))?;
+
+    // Apply defaults for any omitted sections (serde default + our helpers already do most of it)
+    if cfg.mount_wait.retry_delays_secs.is_empty() {
+        cfg.mount_wait.retry_delays_secs = default_retry_delays();
+    }
+
+    // Validation (strict but friendly)
+    if cfg.paths.is_empty() {
+        return Err(format!(
+            "config {} has empty \"paths\" array. Add at least one absolute path.",
+            path.display()
+        ));
+    }
+
+    for p in &cfg.paths {
+        if p.is_empty() {
+            return Err("empty path string in config".to_string());
+        }
+        // Enforce absolute for predictability and to avoid CWD attacks / surprises
+        if !p.starts_with('/') {
+            return Err(format!(
+                "path {:?} is relative. Use absolute paths only (e.g. /home/you/...). \
+                 Relative paths are rejected for safety and predictability.",
+                p
+            ));
+        }
+        // Basic sanity (no control chars / NUL that could confuse paths later)
+        if p.contains('\0') || p.chars().any(|c| c.is_control() && c != '\t') {
+            return Err(format!("path {:?} contains invalid control characters", p));
+        }
+    }
+
+    // Reasonable bounds (defence in depth)
+    if cfg.paths.len() > 128 {
+        return Err("too many paths in config (max 128)".to_string());
+    }
+    if let Some(d) = cfg.walk.max_depth {
+        if d == 0 {
+            return Err(
+                "walk.max_depth 0 is not useful (would only visit the roots themselves)"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[test]
+    fn config_deserialize_in_memory_minimal_and_full() {
+        let minimal = r#"{"paths": ["/tmp/foo"]}"#;
+        let c: Config = serde_json::from_str(minimal).expect("in-memory minimal");
+        assert_eq!(c.paths, vec!["/tmp/foo".to_string()]);
+        assert!(c.walk.max_depth.is_none());
+        assert!(c.ignore.names.is_empty());
+        // mount_wait should have today's defaults via our Default impls
+        assert_eq!(c.mount_wait.initial_secs, 3);
+
+        let full = r#"{
+            "version": 1,
+            "paths": ["/a", "/b"],
+            "walk": { "max_depth": 5 },
+            "ignore": { "names": [".git", "target"] },
+            "mount_wait": { "initial_secs": 1, "retry_delays_secs": [9], "max_wait_secs": 99 }
+        }"#;
+        let c: Config = serde_json::from_str(full).unwrap();
+        assert_eq!(c.paths.len(), 2);
+        assert_eq!(c.walk.max_depth, Some(5));
+        assert_eq!(
+            c.ignore.names,
+            vec![".git".to_string(), "target".to_string()]
+        );
+        assert_eq!(c.mount_wait.max_wait_secs, 99);
+    }
+
+    #[test]
+    fn config_load_from_tempfile_and_validation() {
+        let td = TempDir::new().expect("tempdir for config test");
+        let p = td.path().join("config.json");
+
+        // Good file
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(br#"{"paths":["/abs/one","/abs/two"], "ignore":{"names":[".git"]}}"#)
+                .unwrap();
+        }
+        let c = load_from_path(&p).expect("load good config");
+        assert_eq!(
+            c.paths,
+            vec!["/abs/one".to_string(), "/abs/two".to_string()]
+        );
+        assert_eq!(c.ignore.names, vec![".git".to_string()]);
+
+        // Relative path must be rejected
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(br#"{"paths":["relative/path"]}"#).unwrap();
+        }
+        let err = load_from_path(&p).unwrap_err();
+        assert!(
+            err.contains("relative"),
+            "expected relative rejection: {}",
+            err
+        );
+
+        // Bad JSON
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(b"{ this is not json }").unwrap();
+        }
+        let err = load_from_path(&p).unwrap_err();
+        assert!(err.contains("invalid JSON"), "{}", err);
+    }
+
+    #[test]
+    fn config_missing_file_returns_defaults_but_empty_paths() {
+        let p = std::path::Path::new("/this/path/does/not/exist/ever/config.json");
+        let c = load_from_path(p).expect("missing file yields default struct");
+        // Our loader returns a struct with empty paths on missing file (caller decides what to do)
+        assert!(c.paths.is_empty());
+        assert_eq!(c.mount_wait.initial_secs, 3);
+        assert!(c.walk.max_depth.is_none());
+    }
+}

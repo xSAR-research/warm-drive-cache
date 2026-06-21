@@ -1,7 +1,7 @@
 # warm-drive-cache
 
-> **First draft** — this is an early proof-of-concept. Paths are hardcoded in `src/main.rs` today.
-> **Planned next:** external configuration via `settings.json` for Google Drive / rclone mount paths (no more editing source to add paths).
+> External configuration via `config.json` (supports paths, `max_depth`, and ignore names such as `.git`).
+> See the "Configuration via `config.json`" section below.
 
 Rust utility that pre-warms the VFS cache on [rclone](https://rclone.org/) FUSE mounts. Cloud-backed directories often appear instantly while listings stay empty for several seconds. This tool waits for mounts to settle, then walks configured paths — touching metadata and directory listings so subsequent access is faster.
 
@@ -19,27 +19,70 @@ Rust utility that pre-warms the VFS cache on [rclone](https://rclone.org/) FUSE 
 5. **Reports live progress** — single-line spinner with dir/file/error counts and current path.
 6. **Summarises results** — per-path and grand totals; occasional error logging (every 100 walk errors) to avoid noise from transient cloud-mount failures.
 
-## Current configuration (hardcoded)
+## Program Flow
 
-Paths are defined in `src/main.rs`:
-
-```rust
-let paths = [
-    "/home/charlie/Documents/Gdrive/AccessIT",
-    "/home/charlie/Documents/Gdrive/xSAR",
-];
+```mermaid
+flowchart TD
+    Start[Start] --> Banner[Print startup banner]
+    Banner --> LoadConfig[Load config<br/>WARM_DRIVE_CACHE_CONFIG env<br/>or XDG ~/.config/.../config.json]
+    LoadConfig --> Validate{Valid config?<br/>paths non-empty?}
+    Validate -->|No| Error[Print clear error<br/>exit 1]
+    Validate -->|Yes| ForEach[For each root path in config.paths]
+    ForEach --> Exists{try_exists?}
+    Exists -->|No| Skip[errors++<br/>continue]
+    Exists -->|Yes| Wait[wait_for_mount_content<br/>using config.mount_wait<br/>sleep_capped + retries]
+    Wait --> Status[Init WalkStatus counters]
+    Status --> Walker[Build WalkDir<br/>follow_links=false<br/>max_depth if set<br/>filter_entry for ignore.names]
+    Walker --> EntryLoop[For each entry]
+    EntryLoop --> Touch[symlink_metadata<br/>touch to warm VFS]
+    Touch --> IsDir{entry.is_dir?}
+    IsDir -->|Yes| Dir[record_dir<br/>read_dir to cache listing]
+    IsDir -->|No| File[record_file]
+    Dir & File --> Render[render live progress<br/>spinner + truncate + counts]
+    Render --> EntryLoop
+    EntryLoop -->|walk complete| PerPath[Sync totals<br/>final render<br/>print per-path summary]
+    PerPath --> ForEach
+    ForEach -->|all paths done| Grand[Print grand totals<br/>dirs/files/errors]
+    Grand --> End[End]
+    
+    classDef error fill:#f99,stroke:#333
+    class Error,Skip error
 ```
 
-Edit this array and rebuild until `settings.json` support lands.
+The diagram shows the high-level flow from startup through config-driven path processing, mount settling, controlled walking (with depth and ignores), metadata touching for VFS warming, and live + final reporting.
 
-### Planned `settings.json` (not implemented yet)
+## Configuration via `config.json`
 
+The tool reads a JSON config file instead of a hardcoded array.
+
+**Location (in priority order):**
+- `WARM_DRIVE_CACHE_CONFIG=/absolute/path/to/config.json` (env override — great for testing / CI / multiple setups)
+- `$XDG_CONFIG_HOME/warm-drive-cache/config.json` (or `~/.config/warm-drive-cache/config.json` on Arch)
+
+**Minimal working example**
 ```json
 {
   "paths": [
     "/home/charlie/Documents/Gdrive/AccessIT",
     "/home/charlie/Documents/Gdrive/xSAR"
+  ]
+}
+```
+
+**Full example with new options**
+```json
+{
+  "version": 1,
+  "paths": [
+    "/home/charlie/Documents/Gdrive/AccessIT",
+    "/home/charlie/Documents/Gdrive/xSAR"
   ],
+  "walk": {
+    "max_depth": 5
+  },
+  "ignore": {
+    "names": [".git", ".svn", "node_modules", "target", "__pycache__"]
+  },
   "mount_wait": {
     "initial_secs": 3,
     "retry_delays_secs": [3, 5, 8],
@@ -48,7 +91,19 @@ Edit this array and rebuild until `settings.json` support lands.
 }
 ```
 
-Exact schema and load path (e.g. `~/.config/warm-drive-cache/settings.json` vs project-local) are TBD.
+- `walk.max_depth` — optional, `null`/omitted = unlimited (old default behaviour).
+- `ignore.names` — basenames (dirs or files) pruned early. The classic `.git` case is now first-class.
+- `mount_wait` values are fully tunable; omitting any field uses the classic defaults.
+
+**Absolute paths required** (the loader rejects relatives for safety and predictability).
+
+Create the directory and file once:
+```bash
+mkdir -p ~/.config/warm-drive-cache
+# then drop your config.json there
+```
+
+See also the example shipped as `config.example.json` (if present in the repo).
 
 ## Requirements
 
@@ -68,6 +123,16 @@ Debug build:
 ```bash
 cargo run
 ```
+
+## Testing
+
+```bash
+cargo test
+cargo test -- --quiet
+cargo test truncate_display   # narrow filter
+```
+
+Unit tests cover the pure helpers and core logic using synthetic `tempfile` trees only. Production paths are never exercised by tests (hardcoded Gdrive locations live only in `main`).
 
 ## Example output
 

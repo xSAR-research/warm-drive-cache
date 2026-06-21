@@ -5,3 +5,19 @@ edition = "2024"
 
 [dependencies]
 walkdir = "2"
+# serde + serde_json: required for clean deserialization of config.json (paths, walk.max_depth, ignore.names, mount_wait).
+# directories: the correct tiny crate for XDG-compliant config location (~/.config/warm-drive-cache/config.json or $XDG_CONFIG_HOME).
+# These are runtime deps (config drives the tool). Zero impact on the pure unit-tested helpers.
+# Justification: minimal, data-only, industry standard for this exact use-case. Matches the "Planned next" in README.
+# See approved plan + security subagent review for rationale + alternatives considered.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+directories = "5"
+
+[dev-dependencies]
+# tempfile is dev-only for secure, auto-cleaning TempDir fixtures in unit tests.
+# Enables isolated synthetic directory trees so tests never touch real user paths
+# (e.g. the hardcoded Gdrive mounts). Zero impact on release binaries or runtime deps.
+# Justification: industry standard, RAII Drop safety, minimal + widely audited.
+# See plan + security subagent review for full rationale.
+tempfile = "3"

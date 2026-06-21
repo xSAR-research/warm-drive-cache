@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "paths": [
+    "/home/charlie/Documents/Gdrive/AccessIT",
+    "/home/charlie/Documents/Gdrive/xSAR"
+  ],
+  "walk": {
+    "max_depth": null
+  },
+  "ignore": {
+    "names": [".git", ".svn", "node_modules", ".cache", "target", "__pycache__"]
+  },
+  "mount_wait": {
+    "initial_secs": 3,
+    "retry_delays_secs": [3, 5, 8],
+    "max_wait_secs": 30
+  }
+}
