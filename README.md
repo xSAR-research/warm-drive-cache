@@ -27,12 +27,13 @@ flowchart TD
     Banner --> LoadConfig[Load config<br/>WARM_DRIVE_CACHE_CONFIG env<br/>or XDG ~/.config/.../config.json]
     LoadConfig --> Validate{Valid config?<br/>paths non-empty?}
     Validate -->|No| Error[Print clear error<br/>exit 1]
-    Validate -->|Yes| ForEach[For each root path in config.paths]
+    Validate -->|Yes| PrepIgnore[Build ignore_names HashSet<br/>from config.ignore.names]
+    PrepIgnore --> ForEach[For each root path in config.paths]
     ForEach --> Exists{try_exists?}
     Exists -->|No| Skip[errors++<br/>continue]
     Exists -->|Yes| Wait[wait_for_mount_content<br/>using config.mount_wait<br/>sleep_capped + retries]
     Wait --> Status[Init WalkStatus counters]
-    Status --> Walker[Build WalkDir<br/>follow_links=false<br/>max_depth if set<br/>filter_entry for ignore.names]
+    Status --> Walker[Build WalkDir<br/>follow_links=false<br/>max_depth if set<br/>filter_entry: !should_skip_entry<br/>(depth&gt;0 and basename in ignore)]
     Walker --> EntryLoop[For each entry]
     EntryLoop --> Touch[symlink_metadata<br/>touch to warm VFS]
     Touch --> IsDir{entry.is_dir?}
@@ -49,17 +50,42 @@ flowchart TD
     class Error,Skip error
 ```
 
-The diagram shows the high-level flow from startup through config-driven path processing, mount settling, controlled walking (with depth and ignores), metadata touching for VFS warming, and live + final reporting.
+The diagram shows the high-level flow from startup through config-driven path processing, mount settling, controlled walking (with max_depth and ignore.names — note root protection + subtree pruning via should_skip_entry), metadata touching for VFS warming, and live + final reporting. The ignore HashSet is prepared once before processing paths.
 
 ## Configuration via `config.json`
 
-The tool reads a JSON config file instead of a hardcoded array.
+The tool is configured **exclusively** via a JSON file. There are no hardcoded paths or settings in the source.
 
-**Location (in priority order):**
-- `WARM_DRIVE_CACHE_CONFIG=/absolute/path/to/config.json` (env override — great for testing / CI / multiple setups)
-- `$XDG_CONFIG_HOME/warm-drive-cache/config.json` (or `~/.config/warm-drive-cache/config.json` on Arch)
+### Location (in priority order)
 
-**Minimal working example**
+1. `WARM_DRIVE_CACHE_CONFIG` environment variable (must point to a full path to a `.json` file). Useful for testing, CI, or running with different configurations.
+2. `$XDG_CONFIG_HOME/warm-drive-cache/config.json`  
+   Falls back to `~/.config/warm-drive-cache/config.json` on typical Linux setups (including Arch).
+
+### Missing config file behaviour
+
+If no config file exists at the chosen location:
+- The loader returns a default `Config` (with the classic timing values below).
+- `paths` will be empty.
+- `main()` will then print a clear error and exit, instructing you to create the file.
+
+This is intentional — the tool is useless without at least one path.
+
+### Full Schema
+
+All top-level fields except `paths` are optional and have sensible defaults that match the original hardcoded behaviour.
+
+| Field                        | Type                    | Required | Default          | Description |
+|-----------------------------|-------------------------|----------|------------------|-------------|
+| `version`                   | integer                 | no       | `1`              | Config schema version. Reserved for future breaking changes. |
+| `paths`                     | array of string         | **yes**  | —                | List of **absolute** root directories to warm. Must contain at least one entry. |
+| `walk.max_depth`            | integer or `null`       | no       | `null` (unlimited) | Maximum directory depth for `WalkDir`. `null` or omitted = no limit. |
+| `ignore.names`              | array of string         | no       | `[]`             | Basenames (files or directories) to skip during the walk. Matching directories cause their entire subtree to be pruned. Matching is exact on the basename (case-sensitive) and applies at any depth. The root of any configured path is **never** ignored. |
+| `mount_wait.initial_secs`   | integer                 | no       | `3`              | Seconds to wait after confirming the path exists before checking for content. |
+| `mount_wait.retry_delays_secs` | array of integer     | no       | `[3, 5, 8]`      | List of retry delays (in seconds) used while the directory still appears empty. |
+| `mount_wait.max_wait_secs`  | integer                 | no       | `30`             | Hard ceiling on total waiting time per path. |
+
+### Minimal working example
 ```json
 {
   "paths": [
@@ -69,7 +95,7 @@ The tool reads a JSON config file instead of a hardcoded array.
 }
 ```
 
-**Full example with new options**
+### Full example
 ```json
 {
   "version": 1,
@@ -91,19 +117,22 @@ The tool reads a JSON config file instead of a hardcoded array.
 }
 ```
 
-- `walk.max_depth` — optional, `null`/omitted = unlimited (old default behaviour).
-- `ignore.names` — basenames (dirs or files) pruned early. The classic `.git` case is now first-class.
-- `mount_wait` values are fully tunable; omitting any field uses the classic defaults.
+### Important rules & validation
 
-**Absolute paths required** (the loader rejects relatives for safety and predictability).
+- All paths **must** be absolute (start with `/`). Relative paths are rejected.
+- `paths` must not be empty.
+- `walk.max_depth` of `0` is rejected (it would only visit the root itself).
+- Omitted sections or fields fall back to the values shown in the table above.
+- When the file is completely missing, the program still uses the defaults for `walk`, `ignore`, and `mount_wait`, but `paths` becomes empty and triggers a helpful startup error.
 
-Create the directory and file once:
+See also the ready-to-copy example at `config.example.json` in the repository root.
+
+### Creating the file
 ```bash
 mkdir -p ~/.config/warm-drive-cache
-# then drop your config.json there
+# copy config.example.json and edit the paths
+cp config.example.json ~/.config/warm-drive-cache/config.json
 ```
-
-See also the example shipped as `config.example.json` (if present in the repo).
 
 ## Requirements
 

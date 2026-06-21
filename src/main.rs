@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -194,6 +196,17 @@ impl WalkStatus {
     }
 }
 
+/// Returns true if this entry should be skipped based on the ignore list.
+/// - Never skip the root (depth 0) of a configured path.
+/// - Uses exact OsStr match on basename for correctness with any filename.
+/// - When a directory matches, its entire subtree is pruned by filter_entry.
+fn should_skip_entry(entry: &walkdir::DirEntry, ignore_names: &HashSet<&OsStr>) -> bool {
+    if entry.depth() == 0 {
+        return false;
+    }
+    ignore_names.contains(entry.file_name())
+}
+
 fn main() {
     println!("🚀 warm-drive-cache starting - VFS cache warmer for rclone mounts");
 
@@ -226,6 +239,9 @@ fn main() {
     // Update the security comment for the new world.
     // The old literal array is gone; paths now come exclusively from config.
     // ===========================================
+
+    // Build ignore set once (cheap, O(1) lookup per entry)
+    let ignore_names: HashSet<&OsStr> = cfg.ignore.names.iter().map(|s| OsStr::new(s)).collect();
 
     let mut total_dirs: usize = 0;
     let mut total_files: usize = 0;
@@ -264,17 +280,9 @@ fn main() {
 
         let walker = walker.into_iter().filter_entry(|entry| {
             // Apply ignore list (if any) BEFORE we do any metadata touching or recursion.
-            // This is the exact point the old stub comment was talking about (".git").
-            let name = entry.file_name();
-            if cfg
-                .ignore
-                .names
-                .iter()
-                .any(|n| n.as_str() == name.to_string_lossy().as_ref())
-            {
-                return false;
-            }
-            true
+            // This prunes entire subtrees for matching basenames (e.g. ".git").
+            // We skip the check at depth==0 so the configured root itself is never ignored.
+            !should_skip_entry(entry, &ignore_names)
         });
 
         for entry in walker {

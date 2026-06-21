@@ -54,9 +54,13 @@ pub struct WalkOptions {
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct IgnoreOptions {
-    /// Basenames (dirs or files) to prune early in filter_entry.
-    /// Example: [".git", "node_modules", "target"]
-    /// Matches against entry.file_name() only (cheap, no extra stat).
+    /// List of basenames (dirs or files) to skip.
+    /// Matching dirs will have their entire subtree pruned (via filter_entry).
+    /// Matching is exact on the basename (OsStr, anywhere in the tree).
+    /// The root path itself is never skipped even if its basename matches.
+    ///
+    /// Example: [".git", "node_modules", "target", ".cache"]
+    /// This replaces the old hardcoded "skip .git" stub.
     #[serde(default)]
     pub names: Vec<String>,
 }
