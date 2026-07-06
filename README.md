@@ -23,27 +23,27 @@ Rust utility that pre-warms the VFS cache on [rclone](https://rclone.org/) FUSE 
 
 ```mermaid
 flowchart TD
-    Start[Start] --> Banner[Print startup banner]
-    Banner --> LoadConfig[Load config<br/>WARM_DRIVE_CACHE_CONFIG env<br/>or XDG ~/.config/.../config.json]
-    LoadConfig --> Validate{Valid config?<br/>paths non-empty?}
-    Validate -->|No| Error[Print clear error<br/>exit 1]
-    Validate -->|Yes| PrepIgnore[Build ignore_names HashSet<br/>from config.ignore.names]
-    PrepIgnore --> ForEach[For each root path in config.paths]
-    ForEach --> Exists{try_exists?}
-    Exists -->|No| Skip[errors++<br/>continue]
-    Exists -->|Yes| Wait[wait_for_mount_content<br/>using config.mount_wait<br/>sleep_capped + retries]
-    Wait --> Status[Init WalkStatus counters]
-    Status --> Walker[Build WalkDir<br/>follow_links=false<br/>max_depth if set<br/>filter_entry: !should_skip_entry<br/>(depth&gt;0 and basename in ignore)]
-    Walker --> EntryLoop[For each entry]
-    EntryLoop --> Touch[symlink_metadata<br/>touch to warm VFS]
-    Touch --> IsDir{entry.is_dir?}
-    IsDir -->|Yes| Dir[record_dir<br/>read_dir to cache listing]
-    IsDir -->|No| File[record_file]
-    Dir & File --> Render[render live progress<br/>spinner + truncate + counts]
+    Start[Start] --> Banner["Print startup banner"]
+    Banner --> LoadConfig["Load config\nWARM_DRIVE_CACHE_CONFIG env\nor XDG ~/.config/.../config.json"]
+    LoadConfig --> Validate{"Valid config?\npaths non-empty?"}
+    Validate -->|No| Error["Print clear error\nexit 1"]
+    Validate -->|Yes| PrepIgnore["Build ignore_names HashSet\nfrom config.ignore.names"]
+    PrepIgnore --> ForEach["For each root path in config.paths"]
+    ForEach --> Exists{"try_exists?"}
+    Exists -->|No| Skip["errors++\ncontinue"]
+    Exists -->|Yes| Wait["wait_for_mount_content\nusing config.mount_wait\nsleep_capped + retries"]
+    Wait --> Status["Init WalkStatus counters"]
+    Status --> Walker["Build WalkDir\nfollow_links=false\nmax_depth if set\nfilter_entry: !should_skip_entry\n(depth > 0 and basename in ignore)"]
+    Walker --> EntryLoop["For each entry"]
+    EntryLoop --> Touch["symlink_metadata\ntouch to warm VFS"]
+    Touch --> IsDir{"entry.is_dir?"}
+    IsDir -->|Yes| Dir["record_dir\nread_dir to cache listing"]
+    IsDir -->|No| File["record_file"]
+    Dir & File --> Render["render live progress\nspinner + truncate + counts"]
     Render --> EntryLoop
-    EntryLoop -->|walk complete| PerPath[Sync totals<br/>final render<br/>print per-path summary]
+    EntryLoop -->|walk complete| PerPath["Sync totals\nfinal render\nprint per-path summary"]
     PerPath --> ForEach
-    ForEach -->|all paths done| Grand[Print grand totals<br/>dirs/files/errors]
+    ForEach -->|all paths done| Grand["Print grand totals\ndirs/files/errors"]
     Grand --> End[End]
     
     classDef error fill:#f99,stroke:#333
