@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -208,147 +208,184 @@ fn should_skip_entry(entry: &walkdir::DirEntry, ignore_names: &HashSet<&OsStr>) 
 }
 
 fn main() {
-    println!("🚀 warm-drive-cache starting - VFS cache warmer for rclone mounts");
+    let dry_run = std::env::args().any(|a| a == "--dry-run");
+
+    println!("🚀 warm-drive-cache starting - rclone cache maintenance (refresh via delete)");
 
     // === CONFIG LOADING ===
-    // Replaces the old hardcoded array. See src/config.rs and README for schema + location.
-    // SECURITY: real user-supplied paths are loaded here and only ever used from main().
-    // The unit test harness (below) is forbidden from touching this path or calling main().
+    // Loads array of rclone remote paths from config.json (see src/config.rs and README).
+    // SECURITY: paths loaded from config only; treated as secrets. Never hardcoded.
+    // Tests never call main() or use real paths.
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("❌ warm-drive-cache config error: {}", e);
-            eprintln!("   Typical location: ~/.config/warm-drive-cache/config.json");
+            eprintln!("   Typical location: config.json next to the binary (run directory)");
             eprintln!("   Override with: WARM_DRIVE_CACHE_CONFIG=/path/to/config.json");
             eprintln!("   See the 'config.json' example in the README.");
             std::process::exit(1);
         }
     };
 
-    // If the config file was missing we returned a sentinel with empty paths.
-    // Give the user a clear message instead of silently doing nothing.
     if cfg.paths.is_empty() {
         eprintln!("❌ No paths configured.");
         eprintln!(
-            "   Create ~/.config/warm-drive-cache/config.json with at least one absolute path."
+            "   Create config.json in the run directory (next to the binary) with at least one path."
         );
         eprintln!("   Example is documented in the README.");
         std::process::exit(1);
     }
 
-    // Update the security comment for the new world.
-    // The old literal array is gone; paths now come exclusively from config.
-    // ===========================================
-
-    // Build ignore set once (cheap, O(1) lookup per entry)
-    let ignore_names: HashSet<&OsStr> = cfg.ignore.names.iter().map(|s| OsStr::new(s)).collect();
-
-    let mut total_dirs: usize = 0;
-    let mut total_files: usize = 0;
-    let mut errors: usize = 0;
-
     for root in &cfg.paths {
-        println!("\n📂 Warming path: {}", root);
+        println!("\n📂 Cache dir: {}", root);
 
         let root_path = Path::new(root);
-        match root_path.try_exists() {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!("   ⚠️  Path does not exist or not mounted: {}", root);
-                errors += 1;
-                continue;
-            }
-            Err(e) => {
-                eprintln!("   ⚠️  Cannot check path {}: {}", root, e);
-                errors += 1;
-                continue;
-            }
+        if !root_path.exists() || !root_path.is_dir() {
+            eprintln!("   ⚠️  Cache dir does not exist or is not a directory: {}", root);
+            continue;
         }
 
-        wait_for_mount_content(root_path, &cfg.mount_wait);
+        let before = dir_size(root_path);
+        println!("   Before size: {}", format_bytes(before));
 
-        let path_start_dirs = total_dirs;
-        let path_start_files = total_files;
-        let mut status = WalkStatus::new(total_dirs, total_files, errors);
-        println!("   Walking…");
+        if dry_run {
+            println!("   --dry-run enabled: simulating full deletion (no changes made)");
+            let _ = delete_dir_contents(root_path, true);
+            println!("   After size (simulated): 0 bytes");
+        } else {
+            if !confirm_deletion(root) {
+                println!("   Deletion skipped by user.");
+                continue;
+            }
 
-        let mut walker = WalkDir::new(root).follow_links(false); // Don't follow symlinks for safety on mounts
+            // Walk the directories and read 1 byte from all files found to warm the cache
+            // Display progress as it is traversing
+            println!("   Walking and warming cache (reading 1 byte from files)...");
+            let mut status = WalkStatus::new(0, 0, 0);
+            let mut walker = WalkDir::new(root).follow_links(false);
+            if let Some(depth) = cfg.walk.max_depth {
+                walker = walker.max_depth(depth);
+            }
+            let ignore_names: HashSet<&OsStr> = cfg.ignore.names.iter().map(|s| OsStr::new(s)).collect();
+            let walker = walker.into_iter().filter_entry(|entry| !should_skip_entry(entry, &ignore_names));
 
-        if let Some(depth) = cfg.walk.max_depth {
-            walker = walker.max_depth(depth);
-        }
-
-        let walker = walker.into_iter().filter_entry(|entry| {
-            // Apply ignore list (if any) BEFORE we do any metadata touching or recursion.
-            // This prunes entire subtrees for matching basenames (e.g. ".git").
-            // We skip the check at depth==0 so the configured root itself is never ignored.
-            !should_skip_entry(entry, &ignore_names)
-        });
-
-        for entry in walker {
-            match entry {
-                Ok(entry) => {
-                    let path = entry.path();
-
-                    // Touch metadata - this forces VFS to populate dir/file cache
-                    if fs::symlink_metadata(path).is_err() {
-                        // Silently ignore some transient errors (common with cloud mounts).
-                        // symlink_metadata() avoids following symlinks while still touching metadata.
-                    }
-
-                    if entry.file_type().is_dir() {
-                        status.record_dir();
-                        // Explicitly read dir to ensure directory listing is cached
-                        if let Err(_) = fs::read_dir(path) {
-                            status.record_error();
+            for entry in walker {
+                match entry {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        if entry.file_type().is_dir() {
+                            status.record_dir();
+                            // Cache the directory listing
+                            let _ = fs::read_dir(path);
+                        } else if entry.file_type().is_file() {
+                            status.record_file();
+                            // Read 1 byte from the file to warm the cache
+                            if let Ok(mut f) = fs::File::open(path) {
+                                let mut buf = [0u8; 1];
+                                let _ = f.read(&mut buf);
+                            }
                         }
-                    } else {
-                        status.record_file();
+                        status.render(path, false);
                     }
-
-                    status.render(path, false);
-                }
-                Err(e) => {
-                    status.record_error();
-                    status.render(
-                        e.path().unwrap_or_else(|| Path::new("<unknown>")),
-                        status.errors % 10 == 0,
-                    );
-
-                    // Only log serious ones occasionally (above the live status line)
-                    if status.errors % 100 == 0 {
-                        status.finish_line();
-                        let path_str = e
-                            .path()
-                            .map_or_else(|| "<unknown>".to_string(), |p| p.display().to_string());
-                        eprintln!("   ⚠️  Walk error at {}: {}", path_str, e);
+                    Err(e) => {
+                        status.record_error();
+                        status.render(
+                            e.path().unwrap_or_else(|| Path::new("<unknown>")),
+                            status.errors % 10 == 0,
+                        );
+                        if status.errors % 100 == 0 {
+                            status.finish_line();
+                            let path_str = e
+                                .path()
+                                .map_or_else(|| "<unknown>".to_string(), |p| p.display().to_string());
+                            eprintln!("   ⚠️  Walk error at {}: {}", path_str, e);
+                        }
                     }
                 }
             }
+
+            status.render(root_path, true);
+            status.finish_line();
+
+            let after_warm = dir_size(root_path);
+            println!("   Size after warming: {}", format_bytes(after_warm));
+
+            println!("   Performing complete deletion of all files and subdirectories...");
+            let deleted = delete_dir_contents(root_path, false);
+            let after_delete = dir_size(root_path);
+            println!("   After deletion size: {} (deleted {})", format_bytes(after_delete), format_bytes(deleted));
         }
-
-        total_dirs = status.dirs;
-        total_files = status.files;
-        errors = status.errors;
-
-        status.render(root_path, true);
-        status.finish_line();
-        println!(
-            "   ✓ Finished {} — {} dirs, {} files",
-            root,
-            total_dirs - path_start_dirs,
-            total_files - path_start_files,
-        );
     }
 
-    println!("\n✅ Cache warming complete!");
-    println!("   Directories touched: {}", total_dirs);
-    println!("   Files touched:       {}", total_files);
-    println!("   Errors encountered:  {}", errors);
-    println!("   (Most errors are transient on cloud mounts - normal)");
-    println!(
-        "\n💡 Tip: Run this periodically via systemd timer. Your VFS cache should now be nice and warm."
-    );
+    println!("\n✅ Cache maintenance complete!");
+    println!("   (Because the storage is write-through, no separate cache-clear step is required or executed.)");
+}
+
+/// Compute on-disk size in bytes of a directory tree using std::fs only.
+fn dir_size(path: &Path) -> u64 {
+    let mut size = 0u64;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Ok(meta) = fs::symlink_metadata(&p) {
+                if meta.is_file() {
+                    size += meta.len();
+                } else if meta.is_dir() {
+                    size += dir_size(&p);
+                }
+            }
+        }
+    }
+    size
+}
+
+/// Format size in suitable units (MiB preferred when >= 1 MiB).
+fn format_bytes(bytes: u64) -> String {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    if mib >= 1.0 {
+        format!("{:.2} MiB ({} bytes)", mib, bytes)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Delete all files and subdirectories inside `path` (keep the dir itself).
+/// If dry_run, only print what would be deleted and return estimated size.
+/// Returns bytes deleted (or would-be-deleted).
+fn delete_dir_contents(path: &Path, dry_run: bool) -> u64 {
+    let mut deleted = 0u64;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Ok(meta) = fs::symlink_metadata(&p) {
+                let sz = if meta.is_file() { meta.len() } else { 0 };
+                if dry_run {
+                    println!("   Would delete: {}", p.display());
+                } else if meta.is_dir() {
+                    // Recurse to clear files inside subdir, but keep the directory itself
+                    deleted += delete_dir_contents(&p, dry_run);
+                } else if let Err(e) = fs::remove_file(&p) {
+                    eprintln!("   Warning: failed to remove file {}: {}", p.display(), e);
+                }
+                deleted += sz;
+            }
+        }
+    }
+    deleted
+}
+
+/// Prompt for user approval before destructive deletion, in pacman style.
+/// Defaults to "Y". Accepts "Y", "y", or empty input (just return).
+/// Case-insensitive. Returns true for yes/default, false otherwise.
+fn confirm_deletion(_path: &str) -> bool {
+    eprint!("Delete cache directory [Y/n]? ");
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_ok() {
+        let s = input.trim().to_lowercase();
+        s.is_empty() || s.starts_with('y')
+    } else {
+        false
+    }
 }
 
 // =====================================================================
@@ -356,17 +393,16 @@ fn main() {
 // Added per approved plan. TDD style: behavior assertions, deterministic fixtures.
 //
 // SECURITY (mandatory):
-// - Tests NEVER reference the Gdrive paths array above or invoke main().
+// - Tests NEVER reference real paths or invoke main().
 // - All directory/FS tests create/populate inside tempfile::TempDir only.
 // - No long sleeps; time-dependent paths use synthetic past Instants or pre-populated dirs.
-// - wait_for_mount_content + render I/O + full walk loops are intentionally out of unit scope
-//   (they are integration / manual territory on real mounts).
+// - Delete and size functions use std::fs only in integration/manual tests on real mounts.
 // - tempfile dev-dep provides RAII auto-clean even on panic/abort in test threads.
 //
 // CONFIG TESTS (new in this feature):
 // - Config loading/deser tests live in src/config.rs under the same #[cfg(test)] module.
 // - They use ONLY in-memory JSON strings + tempfile-written files.
-// - They never resolve real XDG ProjectDirs, never use the old Gdrive literals, never call main().
+// - They never resolve real XDG ProjectDirs or run-dir config, never use real path literals, never call main().
 //
 // See AGENTS.md, rust-expert, tdd-test-engineer, and security-audit subagent notes.
 // Run with: cargo test ; cargo test truncate_display -- --exact ; cargo test config_

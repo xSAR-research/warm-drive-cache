@@ -1,8 +1,8 @@
 {
   "version": 1,
   "paths": [
-    "/home/charlie/Documents/Gdrive/AccessIT",
-    "/home/charlie/Documents/Gdrive/xSAR"
+    "rclone://example-remote/example/path1",
+    "rclone://example-remote/example/path2"
   ],
   "walk": {
     "max_depth": null

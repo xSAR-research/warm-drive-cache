@@ -3,28 +3,26 @@
 > External configuration via `config.json` (supports paths, `max_depth`, and ignore names such as `.git`).
 > See the "Configuration via `config.json`" section below.
 
-Rust utility that pre-warms the VFS cache on [rclone](https://rclone.org/) FUSE mounts. Cloud-backed directories often appear instantly while listings stay empty for several seconds. This tool waits for mounts to settle, then walks configured paths — touching metadata and directory listings so subsequent access is faster.
+Rust utility for maintenance of rclone FUSE mount cache directories. It loads configured rclone remote paths, reports on-disk sizes, and performs complete deletion of cache directory contents to prevent stale data accumulation. Because the storage is write-through, no separate cache-clear step is required or executed.
 
-## What it does
+## Configuration
+The tool loads a config.json file containing an array of rclone remote paths to be refreshed.
 
-1. **Checks each configured root path** — skips paths that do not exist or cannot be read.
-2. **Waits for mount content** — FUSE mount points can exist before Google Drive (or other remote) content is visible:
-   - 3 s initial settle time
-   - Retries at 3 s, 5 s, and 8 s if the directory still looks empty
-   - 30 s hard cap per path; proceeds anyway if the budget is exhausted
-3. **Walks the tree** — uses `walkdir` with `follow_links(false)` for safety on cloud mounts.
-4. **Touches cache entries** — for each entry:
-   - `symlink_metadata()` to pull file/dir metadata into the VFS cache (does not follow symlinks)
-   - `read_dir()` on directories to cache listing data
-5. **Reports live progress** — single-line spinner with dir/file/error counts and current path.
-6. **Summarises results** — per-path and grand totals; occasional error logging (every 100 walk errors) to avoid noise from transient cloud-mount failures.
+## Reporting
+The application calculates and reports the on-disk size (in bytes) of the cache directory immediately before and after the refresh operation.
+
+## Cache Maintenance
+The tool performs a complete deletion of all files and subdirectories in the cache directory to prevent stale data accumulation. Use --dry-run to preview; user approval is required for actual deletion.
+
+## Documentation & Secrets Policy
+An example config.json is provided. The README.md, all source comments, and the example file contain no concrete local paths, usernames, or sensitive values. All references use generic placeholders (e.g. rclone://example-remote/example/path). Paths are classified as secrets.
 
 ## Program Flow
 
 ```mermaid
 flowchart TD
     Start[Start] --> Banner["Print startup banner"]
-    Banner --> LoadConfig["Load config\nWARM_DRIVE_CACHE_CONFIG env\nor XDG ~/.config/.../config.json"]
+    Banner --> LoadConfig["Load config\nconfig.json in run dir (next to binary)\nor WARM_DRIVE_CACHE_CONFIG env\nor XDG ~/.config/.../config.json"]
     LoadConfig --> Validate{"Valid config?\npaths non-empty?"}
     Validate -->|No| Error["Print clear error\nexit 1"]
     Validate -->|Yes| PrepIgnore["Build ignore_names HashSet\nfrom config.ignore.names"]
@@ -58,8 +56,9 @@ The tool is configured **exclusively** via a JSON file. There are no hardcoded p
 
 ### Location (in priority order)
 
-1. `WARM_DRIVE_CACHE_CONFIG` environment variable (must point to a full path to a `.json` file). Useful for testing, CI, or running with different configurations.
-2. `$XDG_CONFIG_HOME/warm-drive-cache/config.json`  
+1. `config.json` in the run directory (the directory containing the executable binary). This allows bundling the config next to the binary in release directories.
+2. `WARM_DRIVE_CACHE_CONFIG` environment variable (must point to a full path to a `.json` file). Useful for testing, CI, or running with different configurations.
+3. `$XDG_CONFIG_HOME/warm-drive-cache/config.json`  
    Falls back to `~/.config/warm-drive-cache/config.json` on typical Linux setups (including Arch).
 
 ### Missing config file behaviour
@@ -89,8 +88,8 @@ All top-level fields except `paths` are optional and have sensible defaults that
 ```json
 {
   "paths": [
-    "/home/charlie/Documents/Gdrive/AccessIT",
-    "/home/charlie/Documents/Gdrive/xSAR"
+    "rclone://example-remote/example/path1",
+    "rclone://example-remote/example/path2"
   ]
 }
 ```
@@ -100,8 +99,8 @@ All top-level fields except `paths` are optional and have sensible defaults that
 {
   "version": 1,
   "paths": [
-    "/home/charlie/Documents/Gdrive/AccessIT",
-    "/home/charlie/Documents/Gdrive/xSAR"
+    "rclone://example-remote/example/path1",
+    "rclone://example-remote/example/path2"
   ],
   "walk": {
     "max_depth": 5
@@ -128,17 +127,25 @@ All top-level fields except `paths` are optional and have sensible defaults that
 See also the ready-to-copy example at `config.example.json` in the repository root.
 
 ### Creating the file
+The build process copies `config.example.json` into the release directory (e.g. `target/release/config.example.json`).
+
+```bash
+# After `cargo build --release`
+cp target/release/config.example.json target/release/config.json
+# edit target/release/config.json with your paths
+```
+
+Alternatively for XDG:
 ```bash
 mkdir -p ~/.config/warm-drive-cache
-# copy config.example.json and edit the paths
 cp config.example.json ~/.config/warm-drive-cache/config.json
 ```
 
 ## Requirements
 
 - Rust stable (2024 edition)
-- rclone remote(s) already mounted via FUSE (e.g. under `~/Documents/Gdrive/…`)
-- Linux (uses standard `std::fs` + directory walk; developed on Arch)
+- rclone remote(s) configured (paths provided via config.json)
+- Linux (uses standard `std::fs`; developed on Arch)
 
 ## Build & run
 
@@ -161,39 +168,26 @@ cargo test -- --quiet
 cargo test truncate_display   # narrow filter
 ```
 
-Unit tests cover the pure helpers and core logic using synthetic `tempfile` trees only. Production paths are never exercised by tests (hardcoded Gdrive locations live only in `main`).
+Unit tests cover the pure helpers and core logic using synthetic `tempfile` trees only. Production paths are never exercised by tests (paths are loaded from config.json and treated as secrets).
 
 ## Example output
 
 ```
-🚀 warm-drive-cache starting - VFS cache warmer for rclone mounts
+🚀 warm-drive-cache starting - rclone cache maintenance (refresh via delete)
 
-📂 Warming path: /home/charlie/Documents/Gdrive/AccessIT
-   ⏳ Path exists — waiting 3s for mount to settle (max 30s total)...
-   ✓ Directory has content, starting walk.
-   Walking…
-   ⠹  dirs    142  files   1083  errs    2    12s  …/AccessIT/projects/foo
-   ✓ Finished /home/charlie/Documents/Gdrive/AccessIT — 142 dirs, 1083 files
+📂 Cache dir: rclone://example-remote/example/path1
+   Before size: 12345678 bytes
+   --dry-run enabled: simulating full deletion (no changes made)
+   Would delete: ...
+   After size (simulated): 0 bytes
 
-✅ Cache warming complete!
-   Directories touched: 142
-   Files touched:       1083
-   Errors encountered:  2
-   (Most errors are transient on cloud mounts - normal)
+✅ Cache maintenance complete!
+   (Because the storage is write-through, no separate cache-clear step is required or executed.)
 ```
-
-## Timing constants (source)
-
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `INITIAL_WAIT_SECS` | 3 | Pause after path exists, before content check |
-| `RETRY_DELAYS_SECS` | 3, 5, 8 | Back-off when directory listing is still empty |
-| `MAX_WAIT_SECS` | 30 | Maximum wait per path |
-| `STATUS_REFRESH` | 80 ms | Live status line refresh interval |
 
 ## Deployment tip
 
-Run periodically via a **systemd timer** after rclone mounts come up at login or boot — keeps the VFS cache warm without manual runs.
+Run periodically via a **systemd timer** after rclone mounts come up at login or boot to keep caches fresh (use --dry-run first).
 
 ## Licence
 

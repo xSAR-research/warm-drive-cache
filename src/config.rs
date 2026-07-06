@@ -13,7 +13,7 @@
 // - Paths must be non-empty and absolute (reject relatives for predictability + safety)
 // - Users are strongly encouraged (and now enforced) to use absolute paths
 //
-// This module is pure data + fs read. No side effects on the VFS cache warmer itself.
+// This module is pure data + fs read. No side effects on the cache maintenance logic itself.
 // The 12 existing unit tests continue to pass because they never call main() or this loader for real paths.
 //
 // See README for example + location documentation.
@@ -96,8 +96,19 @@ fn default_max_wait_secs() -> u64 {
 }
 
 /// Main entry point used by the binary.
-/// Respects WARM_DRIVE_CACHE_CONFIG env var, falls back to XDG ProjectDirs.
+/// Checks the run directory (directory containing the executable) for `config.json` first.
+/// Falls back to WARM_DRIVE_CACHE_CONFIG env var, then XDG ProjectDirs.
 pub fn load() -> Result<Config, String> {
+    // Check run directory (next to the binary) for config.json
+    if let Ok(exe) = env::current_exe() {
+        if let Some(run_dir) = exe.parent() {
+            let local = run_dir.join("config.json");
+            if local.exists() {
+                return load_from_path(&local);
+            }
+        }
+    }
+
     if let Ok(p) = env::var("WARM_DRIVE_CACHE_CONFIG") {
         if !p.is_empty() {
             return load_from_path(&PathBuf::from(p));
@@ -158,7 +169,7 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config, String> {
         // Enforce absolute for predictability and to avoid CWD attacks / surprises
         if !p.starts_with('/') {
             return Err(format!(
-                "path {:?} is relative. Use absolute paths only (e.g. /home/you/...). \
+                "path {:?} is relative. Use absolute paths only (e.g. /path/to/cache). \
                  Relative paths are rejected for safety and predictability.",
                 p
             ));

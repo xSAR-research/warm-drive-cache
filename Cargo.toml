@@ -17,7 +17,7 @@ directories = "5"
 [dev-dependencies]
 # tempfile is dev-only for secure, auto-cleaning TempDir fixtures in unit tests.
 # Enables isolated synthetic directory trees so tests never touch real user paths
-# (e.g. the hardcoded Gdrive mounts). Zero impact on release binaries or runtime deps.
+# (paths treated as secrets; no hardcoded values). Zero impact on release binaries or runtime deps.
 # Justification: industry standard, RAII Drop safety, minimal + widely audited.
 # See plan + security subagent review for full rationale.
 tempfile = "3"
