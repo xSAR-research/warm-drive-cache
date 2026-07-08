@@ -2,6 +2,10 @@
 name = "warm-drive-cache"
 version = "0.1.0"
 edition = "2024"
+authors = ["Charlie <info@xsar.com.au>"]
+license = "MIT"
+homepage = "https://xSAR.com.au"
+repository = "https://github.com/xSAR-research/warm-drive-cache"
 
 [dependencies]
 walkdir = "2"

@@ -3,7 +3,7 @@
 > External configuration via `config.json` (supports paths, `max_depth`, and ignore names such as `.git`).
 > See the "Configuration via `config.json`" section below.
 
-Rust utility for maintenance of rclone FUSE mount cache directories.
+Rust utility for maintenance of rclone FUSE mount cache directories. Part of the [xSAR](https://xSAR.com.au) toolkit.
 
 **Critical distinction (safety):**
 - "sync" (exposed) directories: the paths rclone mounts (e.g. /home/user/mounts/myproject). The tool ONLY traverses these and reads 1 byte from each file to warm/update metadata in the cache. **NEVER delete from sync directories** — they contain your live data.
@@ -185,7 +185,8 @@ Unit tests cover the pure helpers and core logic using synthetic `tempfile` tree
 ## Example output
 
 ```
-🚀 warm-drive-cache starting - rclone cache maintenance (refresh via delete)
+🚀 warm-drive-cache: Rust utility for removing cache staleness and warming.
+   Licenced under MIT by xSAR. For more tools visit https://xSAR.com.au or our repo at https://github.com/xSAR-research/warm-drive-cache
 
 📂 Sync dir (traverse/warm only): rclone://example-remote/example/path1
    Cache dir (size/delete only): /path/to/rclone/cache
@@ -271,6 +272,10 @@ WantedBy=default.target
 - A similar unit can be created for another remote (e.g. `gdrive-archive.service` pointing at the `archive` remote and its mount/cache paths).
 - You can create a systemd user timer (or use `warm-drive-cache` directly via a timer) that starts after these mounts are active.
 
+## More from xSAR
+
+For more tools, guides, and projects, visit [xSAR](https://xSAR.com.au).
+
 ## Licence
 
-TBD.
+This project is licensed under the [MIT License](LICENSE). See the `LICENSE` file for full details.
