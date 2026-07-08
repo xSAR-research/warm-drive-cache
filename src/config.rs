@@ -28,8 +28,10 @@ pub struct Config {
     #[serde(default = "default_version")]
     pub version: u32,
 
-    /// List of absolute root paths to warm. Replaces the old hardcoded array.
-    pub paths: Vec<String>,
+    /// List of path pairs. "sync" is the rclone-exposed directory (traversed and 1 byte read per file to warm).
+    /// "cache" is the rclone --cache-dir (used ONLY for size calculation and deletion to clear stale cache data).
+    /// The cache dir is typically separate from the sync dir to avoid deleting live data.
+    pub paths: Vec<PathPair>,
 
     #[serde(default)]
     pub walk: WalkOptions,
@@ -39,6 +41,17 @@ pub struct Config {
 
     #[serde(default)]
     pub mount_wait: MountWait,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PathPair {
+    /// The directory exposed by rclone mount (e.g. /home/user/Documents/Gdrive/AccessIT).
+    /// ONLY traversed for warming (read 1 byte from each file). NEVER delete from here.
+    pub sync: String,
+    /// The rclone cache directory (from --cache-dir in service unit, e.g. /home/user/.rclone_cache).
+    /// Used for on-disk size checks and complete deletion of contents to refresh cache.
+    /// Can be shared across multiple sync dirs.
+    pub cache: String,
 }
 
 fn default_version() -> u32 {
@@ -157,26 +170,36 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config, String> {
     // Validation (strict but friendly)
     if cfg.paths.is_empty() {
         return Err(format!(
-            "config {} has empty \"paths\" array. Add at least one absolute path.",
+            "config {} has empty \"paths\" array. Add at least one path pair with \"sync\" and \"cache\".",
             path.display()
         ));
     }
 
-    for p in &cfg.paths {
-        if p.is_empty() {
-            return Err("empty path string in config".to_string());
+    for pair in &cfg.paths {
+        for (label, p) in [("sync", &pair.sync), ("cache", &pair.cache)] {
+            if p.is_empty() {
+                return Err(format!("empty {} path string in config", label));
+            }
+            // Enforce absolute for predictability and to avoid CWD attacks / surprises
+            if !p.starts_with('/') {
+                return Err(format!(
+                    "{} path {:?} is relative. Use absolute paths only (e.g. /path/to/...). \
+                     Relative paths are rejected for safety and predictability.",
+                    label, p
+                ));
+            }
+            // Basic sanity (no control chars / NUL that could confuse paths later)
+            if p.contains('\0') || p.chars().any(|c| c.is_control() && c != '\t') {
+                return Err(format!("{} path {:?} contains invalid control characters", label, p));
+            }
         }
-        // Enforce absolute for predictability and to avoid CWD attacks / surprises
-        if !p.starts_with('/') {
+        // Safety: cache must not be under or same as sync (to prevent deleting live data)
+        if pair.cache.starts_with(&pair.sync) || pair.sync.starts_with(&pair.cache) {
             return Err(format!(
-                "path {:?} is relative. Use absolute paths only (e.g. /path/to/cache). \
-                 Relative paths are rejected for safety and predictability.",
-                p
+                "cache {:?} and sync {:?} must not overlap or contain each other. \
+                 Deletion happens ONLY on cache; traversal ONLY on sync.",
+                pair.cache, pair.sync
             ));
-        }
-        // Basic sanity (no control chars / NUL that could confuse paths later)
-        if p.contains('\0') || p.chars().any(|c| c.is_control() && c != '\t') {
-            return Err(format!("path {:?} contains invalid control characters", p));
         }
     }
 
@@ -205,9 +228,11 @@ mod tests {
 
     #[test]
     fn config_deserialize_in_memory_minimal_and_full() {
-        let minimal = r#"{"paths": ["/tmp/foo"]}"#;
+        let minimal = r#"{"paths": [{"sync": "/tmp/foo", "cache": "/tmp/cache"}]}"#;
         let c: Config = serde_json::from_str(minimal).expect("in-memory minimal");
-        assert_eq!(c.paths, vec!["/tmp/foo".to_string()]);
+        assert_eq!(c.paths.len(), 1);
+        assert_eq!(c.paths[0].sync, "/tmp/foo");
+        assert_eq!(c.paths[0].cache, "/tmp/cache");
         assert!(c.walk.max_depth.is_none());
         assert!(c.ignore.names.is_empty());
         // mount_wait should have today's defaults via our Default impls
@@ -215,13 +240,18 @@ mod tests {
 
         let full = r#"{
             "version": 1,
-            "paths": ["/a", "/b"],
+            "paths": [
+                {"sync": "/a", "cache": "/cache/a"},
+                {"sync": "/b", "cache": "/cache/b"}
+            ],
             "walk": { "max_depth": 5 },
             "ignore": { "names": [".git", "target"] },
             "mount_wait": { "initial_secs": 1, "retry_delays_secs": [9], "max_wait_secs": 99 }
         }"#;
         let c: Config = serde_json::from_str(full).unwrap();
         assert_eq!(c.paths.len(), 2);
+        assert_eq!(c.paths[0].sync, "/a");
+        assert_eq!(c.paths[0].cache, "/cache/a");
         assert_eq!(c.walk.max_depth, Some(5));
         assert_eq!(
             c.ignore.names,
@@ -238,20 +268,19 @@ mod tests {
         // Good file
         {
             let mut f = File::create(&p).unwrap();
-            f.write_all(br#"{"paths":["/abs/one","/abs/two"], "ignore":{"names":[".git"]}}"#)
+            f.write_all(br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"},{"sync":"/abs/two","cache":"/cache/abs"}], "ignore":{"names":[".git"]}}"#)
                 .unwrap();
         }
         let c = load_from_path(&p).expect("load good config");
-        assert_eq!(
-            c.paths,
-            vec!["/abs/one".to_string(), "/abs/two".to_string()]
-        );
+        assert_eq!(c.paths.len(), 2);
+        assert_eq!(c.paths[0].sync, "/abs/one");
+        assert_eq!(c.paths[0].cache, "/cache/abs");
         assert_eq!(c.ignore.names, vec![".git".to_string()]);
 
         // Relative path must be rejected
         {
             let mut f = File::create(&p).unwrap();
-            f.write_all(br#"{"paths":["relative/path"]}"#).unwrap();
+            f.write_all(br#"{"paths":[{"sync":"relative/path","cache":"/cache/foo"}]}"#).unwrap();
         }
         let err = load_from_path(&p).unwrap_err();
         assert!(

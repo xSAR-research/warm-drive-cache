@@ -1,8 +1,14 @@
 {
   "version": 1,
   "paths": [
-    "rclone://example-remote/example/path1",
-    "rclone://example-remote/example/path2"
+    {
+      "sync": "rclone://example-remote/example/path1",
+      "cache": "/path/to/rclone/cache"
+    },
+    {
+      "sync": "rclone://example-remote/example/path2",
+      "cache": "/path/to/rclone/cache"
+    }
   ],
   "walk": {
     "max_depth": null

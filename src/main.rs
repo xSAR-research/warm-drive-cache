@@ -213,9 +213,12 @@ fn main() {
     println!("🚀 warm-drive-cache starting - rclone cache maintenance (refresh via delete)");
 
     // === CONFIG LOADING ===
-    // Loads array of rclone remote paths from config.json (see src/config.rs and README).
+    // Loads array of rclone path pairs from config.json (see src/config.rs and README).
+    // Each pair: "sync" (exposed rclone dir: ONLY traverse + read 1 byte/file to warm).
+    //            "cache" (rclone --cache-dir: ONLY for size calc and deletion to clear stale data).
     // SECURITY: paths loaded from config only; treated as secrets. Never hardcoded.
     // Tests never call main() or use real paths.
+    // IMPORTANT: Deletion and size checks MUST NEVER target sync dirs (live data).
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -230,39 +233,51 @@ fn main() {
     if cfg.paths.is_empty() {
         eprintln!("❌ No paths configured.");
         eprintln!(
-            "   Create config.json in the run directory (next to the binary) with at least one path."
+            "   Create config.json in the run directory (next to the binary) with at least one {{\"sync\":..., \"cache\":...}} pair."
         );
         eprintln!("   Example is documented in the README.");
         std::process::exit(1);
     }
 
-    for root in &cfg.paths {
-        println!("\n📂 Cache dir: {}", root);
+    for pair in &cfg.paths {
+        let sync_path = Path::new(&pair.sync);
+        let cache_path = Path::new(&pair.cache);
 
-        let root_path = Path::new(root);
-        if !root_path.exists() || !root_path.is_dir() {
-            eprintln!("   ⚠️  Cache dir does not exist or is not a directory: {}", root);
+        if !sync_path.exists() || !sync_path.is_dir() {
+            eprintln!("   ⚠️  Sync dir does not exist or is not a directory: {}", pair.sync);
+            continue;
+        }
+        if !cache_path.exists() || !cache_path.is_dir() {
+            eprintln!("   ⚠️  Cache dir does not exist or is not a directory: {}", pair.cache);
             continue;
         }
 
-        let before = dir_size(root_path);
-        println!("   Before size: {}", format_bytes(before));
+        // Size and date range on CACHE only
+        let before = dir_size(cache_path);
+        println!("\n📂 Sync dir (traverse/warm only): {}", pair.sync);
+        println!("   Cache dir (size/delete only): {}", pair.cache);
+        println!("   Before size (cache): {}", format_bytes(before));
 
         if dry_run {
             println!("   --dry-run enabled: simulating full deletion (no changes made)");
-            let _ = delete_dir_contents(root_path, true);
-            println!("   After size (simulated): 0 bytes");
+            let _ = delete_dir_contents(cache_path, true);
+            println!("   After size (simulated, cache): 0 bytes");
         } else {
-            if !confirm_deletion(root) {
+            if !confirm_deletion(&pair.cache) {
                 println!("   Deletion skipped by user.");
                 continue;
             }
 
-            // Walk the directories and read 1 byte from all files found to warm the cache
-            // Display progress as it is traversing
-            println!("   Walking and warming cache (reading 1 byte from files)...");
+            // Delete cache FIRST (clear stale)
+            println!("   Performing complete deletion of all files and subdirectories in cache dir...");
+            let deleted = delete_dir_contents(cache_path, false);
+            let after_delete = dir_size(cache_path);
+            println!("   After deletion size (cache): {} (deleted {})", format_bytes(after_delete), format_bytes(deleted));
+
+            // THEN walk the SYNC dir and read 1 byte from each file to warm
+            println!("   Walking sync dir and reading 1 byte from files to warm cache...");
             let mut status = WalkStatus::new(0, 0, 0);
-            let mut walker = WalkDir::new(root).follow_links(false);
+            let mut walker = WalkDir::new(sync_path).follow_links(false);
             if let Some(depth) = cfg.walk.max_depth {
                 walker = walker.max_depth(depth);
             }
@@ -279,10 +294,18 @@ fn main() {
                             let _ = fs::read_dir(path);
                         } else if entry.file_type().is_file() {
                             status.record_file();
-                            // Read 1 byte from the file to warm the cache
+                            // Read 1 byte from the file to warm the cache (triggers rclone full read if needed)
                             if let Ok(mut f) = fs::File::open(path) {
                                 let mut buf = [0u8; 1];
-                                let _ = f.read(&mut buf);
+                                if let Err(e) = f.read(&mut buf) {
+                                    status.record_error();
+                                    // Catch API limit / rate errors etc.; rclone will have triggered full file read
+                                    if e.to_string().to_lowercase().contains("limit") ||
+                                       e.to_string().to_lowercase().contains("rate") ||
+                                       e.to_string().to_lowercase().contains("429") {
+                                        eprintln!("   ⚠️  Possible API limit on read (skipped file, rclone may have fetched full): {}", path.display());
+                                    }
+                                }
                             }
                         }
                         status.render(path, false);
@@ -304,16 +327,14 @@ fn main() {
                 }
             }
 
-            status.render(root_path, true);
+            status.render(sync_path, true);
             status.finish_line();
 
-            let after_warm = dir_size(root_path);
-            println!("   Size after warming: {}", format_bytes(after_warm));
+            let after_warm = dir_size(cache_path);
+            println!("   Size after warming (cache): {}", format_bytes(after_warm));
 
-            println!("   Performing complete deletion of all files and subdirectories...");
-            let deleted = delete_dir_contents(root_path, false);
-            let after_delete = dir_size(root_path);
-            println!("   After deletion size: {} (deleted {})", format_bytes(after_delete), format_bytes(deleted));
+            println!("   Directories processed: {}", status.dirs);
+            println!("   Files processed: {}", status.files);
         }
     }
 
@@ -377,8 +398,8 @@ fn delete_dir_contents(path: &Path, dry_run: bool) -> u64 {
 /// Prompt for user approval before destructive deletion, in pacman style.
 /// Defaults to "Y". Accepts "Y", "y", or empty input (just return).
 /// Case-insensitive. Returns true for yes/default, false otherwise.
-fn confirm_deletion(_path: &str) -> bool {
-    eprint!("Delete cache directory [Y/n]? ");
+fn confirm_deletion(_cache_path: &str) -> bool {
+    eprint!("delete [Y/n]? ");
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_ok() {
         let s = input.trim().to_lowercase();
