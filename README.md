@@ -6,8 +6,8 @@
 Rust utility for maintenance of rclone FUSE mount cache directories.
 
 **Critical distinction (safety):**
-- "sync" (exposed) directories: the paths rclone mounts (e.g. /home/user/Documents/Gdrive/AccessIT). The tool ONLY traverses these and reads 1 byte from each file to warm/update metadata in the cache. **NEVER delete from sync directories** — they contain your live data.
-- "cache" directory: the separate directory given to rclone via `--cache-dir` (e.g. /home/user/.rclone_cache). The tool calculates on-disk size (before/after) and performs complete deletion of contents here only, to clear stale cached data.
+- "sync" (exposed) directories: the paths rclone mounts (e.g. /home/user/mounts/myproject). The tool ONLY traverses these and reads 1 byte from each file to warm/update metadata in the cache. **NEVER delete from sync directories** — they contain your live data.
+- "cache" directory: the separate directory given to rclone via `--cache-dir` (e.g. ~/.rclone_cache). The tool calculates on-disk size (before/after) and performs complete deletion of contents here only, to clear stale cached data.
 
 The cache dir is often shared across multiple sync dirs. See your rclone systemd units for the exact `--cache-dir` value.
 
@@ -107,8 +107,8 @@ All top-level fields except `paths` are optional and have sensible defaults that
 {
   "version": 1,
   "paths": [
-    {"sync": "/home/user/Gdrive/AccessIT", "cache": "/home/user/.rclone_cache"},
-    {"sync": "/home/user/Gdrive/xSAR", "cache": "/home/user/.rclone_cache"}
+    {"sync": "/home/user/mounts/project-a", "cache": "/home/user/.rclone_cache"},
+    {"sync": "/home/user/mounts/project-b", "cache": "/home/user/.rclone_cache"}
   ],
   "walk": {
     "max_depth": 5
@@ -206,20 +206,20 @@ Run periodically via a **systemd timer** after rclone mounts come up at login or
 
 This tool is designed to work with rclone VFS mounts managed by systemd.
 
-The following is a **sample** of a systemd **user unit** (with all personal secrets, usernames, and specific paths stripped). It is **not** a system unit installed under `/etc/systemd/system/`. Because the services run as your regular user (e.g. `charlie`), these are **user units**.
+The following is a **sample** of a systemd **user unit** (with all personal secrets, usernames, and specific paths stripped). It is **not** a system unit installed under `/etc/systemd/system/`. Because the services run as your regular user account, these are **user units**.
 
 ### Important notes
 - The mount point directory **must** be created in advance and must be writable/accessible by your user:
   ```bash
-  mkdir -p ~/Documents/Gdrive/AccessIT
+  mkdir -p ~/mounts/myproject
   ```
-- Your rclone remote (here called `accessit`) must already be configured.
+- Your rclone remote (here called `myremote`) must already be configured.
 
 ### Where to install the unit file
 User units belong in your user's systemd configuration directory:
 
 ```
-~/.config/systemd/user/gdrive-accessit.service
+~/.config/systemd/user/gdrive-myproject.service
 ```
 
 ### Commands to enable and start the service
@@ -227,36 +227,36 @@ User units belong in your user's systemd configuration directory:
 # 1. Place the unit file in the location shown above
 # 2. Reload user units and enable + start the service
 systemctl --user daemon-reload
-systemctl --user enable --now gdrive-accessit.service
+systemctl --user enable --now gdrive-myproject.service
 
 # Check that it is running
-systemctl --user status gdrive-accessit.service
+systemctl --user status gdrive-myproject.service
 
 # View logs
-journalctl --user -u gdrive-accessit.service -f
+journalctl --user -u gdrive-myproject.service -f
 ```
 
-### Sample unit file (`gdrive-accessit.service`)
+### Sample unit file (`gdrive-myproject.service`)
 
 ```ini
 [Unit]
-Description=rclone VFS mount for AccessIT GDrive
+Description=rclone VFS mount for MyProject
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStartPre=/bin/mkdir -p %h/Documents/Gdrive/AccessIT
-ExecStart=/usr/bin/rclone mount accessit: %h/Documents/Gdrive/AccessIT \
+ExecStartPre=/bin/mkdir -p %h/mounts/myproject
+ExecStart=/usr/bin/rclone mount myremote: %h/mounts/myproject \
     --config=%h/.config/rclone/rclone.conf \
     --vfs-cache-mode full \
-    --cache-dir=%h/repo/.rclone_cache \
+    --cache-dir=%h/.rclone_cache \
     --dir-cache-time 5m \
     --poll-interval 1m \
     --vfs-read-chunk-size 64M \
     --log-level INFO
 
-ExecStop=/bin/fusermount -u %h/Documents/Gdrive/AccessIT
+ExecStop=/bin/fusermount -u %h/mounts/myproject
 
 Restart=on-failure
 RestartSec=10
@@ -268,7 +268,7 @@ WantedBy=default.target
 **Notes on the sample:**
 - Uses systemd specifiers like `%h` (expands to the user's home directory) so the unit is easy to reuse.
 - The `--cache-dir` points to the rclone cache directory used by the mount (see your `config.json` for the exact value used by `warm-drive-cache`).
-- A similar unit can be created for the other remote (e.g. `gdrive-xsar.service` pointing at the `xsar` remote and its mount/cache paths).
+- A similar unit can be created for another remote (e.g. `gdrive-archive.service` pointing at the `archive` remote and its mount/cache paths).
 - You can create a systemd user timer (or use `warm-drive-cache` directly via a timer) that starts after these mounts are active.
 
 ## Licence
