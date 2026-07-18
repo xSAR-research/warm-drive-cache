@@ -3,20 +3,257 @@
 //! Load order: run-dir `config.json` → `WARM_DRIVE_CACHE_CONFIG` → XDG config path.
 //! Public sample is tracked as `config.example.json`; local `config.json` is gitignored.
 //!
+//! Size fields accept JSON integers **or** strings with optional units
+//! (`64KiB`, `64K`, `1MB`, …). See [`parse_size_expr`].
+//!
 //! See README for schema and examples. More xSAR tools: https://xSAR.com.au
 
+use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
+
+// ── Human-readable size parsing ─────────────────────────────────────────────
+
+/// Multiplier for a unit suffix (case-insensitive). Binary powers of 1024.
+///
+/// Accepted (with or without spaces before the unit):
+/// - no unit / `B` / `b` → bytes
+/// - `K` / `KB` / `KiB` → 1024
+/// - `M` / `MB` / `MiB` → 1024²
+/// - `G` / `GB` / `GiB` → 1024³
+/// - `T` / `TB` / `TiB` → 1024⁴
+/// - `P` / `PB` / `PiB` → 1024⁵
+///
+/// `B` and `b` are treated the same (bytes). Single-letter `K`/`M`/… omit the `B`.
+fn unit_multiplier(unit: &str) -> Result<f64, String> {
+    let u = unit.trim().to_ascii_lowercase();
+    // Strip a trailing "ib" / "b" ambiguity by matching longest known forms first.
+    let mult = match u.as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "p" | "pb" | "pib" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => {
+            return Err(format!(
+                "unknown size unit {unit:?} (use B, K/KB/KiB, M/MB/MiB, G/GB/GiB, T/TB/TiB, P/PB/PiB; \
+                 case-insensitive; bare K means KiB)"
+            ));
+        }
+    };
+    Ok(mult)
+}
+
+/// Parse a size expression into a signed byte count.
+///
+/// Accepts:
+/// - bare integers: `65536`, `-1`
+/// - decimals with units: `1.5MiB`, `64k`
+/// - optional whitespace: `64 KiB`
+///
+/// `-1` with no unit is the only allowed negative (metadata-only policy for max).
+pub fn parse_size_expr(input: &str) -> Result<i64, String> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Err("size string is empty".into());
+    }
+
+    let (negative, body) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest.trim_start())
+    } else if let Some(rest) = s.strip_prefix('+') {
+        (false, rest.trim_start())
+    } else {
+        (false, s)
+    };
+
+    if body.is_empty() {
+        return Err(format!("invalid size expression {input:?}"));
+    }
+
+    // Coefficient: digits and at most one '.'
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() {
+            saw_digit = true;
+            i += 1;
+        } else if c == b'.' && !saw_dot {
+            saw_dot = true;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if !saw_digit {
+        return Err(format!(
+            "configuration error: size {input:?} must start with a number \
+             (e.g. 65536, \"64KiB\", \"64K\", \"1MB\")"
+        ));
+    }
+
+    let num_str = &body[..i];
+    let unit = body[i..].trim();
+    let coef: f64 = num_str.parse().map_err(|_| {
+        format!("configuration error: cannot parse numeric part of size {input:?}")
+    })?;
+
+    if negative {
+        // Only exact -1 (no unit) is meaningful for max_file_size_bytes.
+        if (coef - 1.0).abs() < f64::EPSILON && unit.is_empty() {
+            return Ok(-1);
+        }
+        return Err(format!(
+            "configuration error: negative size {input:?} is invalid. \
+             Only -1 (metadata only) is allowed as a negative value for max_file_size_bytes"
+        ));
+    }
+
+    let mult = unit_multiplier(unit)?;
+    let product = coef * mult;
+    if !product.is_finite() || product < 0.0 {
+        return Err(format!("configuration error: size {input:?} is out of range"));
+    }
+    if product > i64::MAX as f64 {
+        return Err(format!(
+            "configuration error: size {input:?} exceeds maximum representable bytes"
+        ));
+    }
+    // Round half away from zero for fractional coefficients (1.5KiB → 1536).
+    Ok(product.round() as i64)
+}
+
+/// Parse a non-negative size (for `min_file_size_bytes`).
+pub fn parse_non_negative_size(input: &str) -> Result<u64, String> {
+    let v = parse_size_expr(input)?;
+    if v < 0 {
+        return Err(format!(
+            "configuration error: min_file_size_bytes cannot be negative (got {input:?})"
+        ));
+    }
+    Ok(v as u64)
+}
+
+fn deserialize_min_file_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct MinVisitor;
+    impl<'de> Visitor<'de> for MinVisitor {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a non-negative size as integer or string (e.g. 1024, \"64KiB\", \"64K\")")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+            if v < 0 {
+                return Err(E::custom(format!(
+                    "configuration error: walk.min_file_size_bytes cannot be negative (got {v})"
+                )));
+            }
+            Ok(v as u64)
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<u64, E> {
+            if !v.is_finite() || v < 0.0 {
+                return Err(E::custom(format!(
+                    "configuration error: walk.min_file_size_bytes invalid number {v}"
+                )));
+            }
+            if (v - v.round()).abs() > 1e-9 {
+                return Err(E::custom(format!(
+                    "configuration error: walk.min_file_size_bytes bare number must be a whole \
+                     byte count (got {v}); use a string with a unit for fractional values \
+                     (e.g. \"1.5KiB\")"
+                )));
+            }
+            Ok(v.round() as u64)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            parse_non_negative_size(v).map_err(E::custom)
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<u64, E> {
+            self.visit_str(&v)
+        }
+    }
+    deserializer.deserialize_any(MinVisitor)
+}
+
+fn deserialize_max_file_size<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct MaxVisitor;
+    impl<'de> Visitor<'de> for MaxVisitor {
+        type Value = i64;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str(
+                "a size as integer or string: -1, 0, N, or \"64KiB\" / \"64K\" / \"1MB\" / …",
+            )
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i64, E> {
+            Ok(v)
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i64, E> {
+            if v > i64::MAX as u64 {
+                return Err(E::custom(
+                    "configuration error: walk.max_file_size_bytes exceeds i64 range",
+                ));
+            }
+            Ok(v as i64)
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<i64, E> {
+            if !v.is_finite() {
+                return Err(E::custom(
+                    "configuration error: walk.max_file_size_bytes is not a finite number",
+                ));
+            }
+            if (v - v.round()).abs() > 1e-9 {
+                return Err(E::custom(format!(
+                    "configuration error: walk.max_file_size_bytes bare number must be a whole \
+                     byte count (got {v}); use a string with a unit for fractional values \
+                     (e.g. \"1.5MiB\"), or an integer special value (-1, 0, N)"
+                )));
+            }
+            Ok(v.round() as i64)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<i64, E> {
+            parse_size_expr(v).map_err(E::custom)
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<i64, E> {
+            self.visit_str(&v)
+        }
+    }
+    deserializer.deserialize_any(MaxVisitor)
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     #[serde(default = "default_version")]
     pub version: u32,
 
-    /// List of path pairs. "sync" is the rclone-exposed directory (traversed; size-gated 1-byte warm or metadata only).
-    /// "cache" is the rclone --cache-dir (used ONLY for size calculation and deletion to clear stale cache data).
+    /// List of path pairs. "sync" is the rclone-exposed directory (traversed; size-gated
+    /// File contents read or metadata only). "cache" is the rclone --cache-dir (used ONLY for
+    /// size calculation and deletion to clear stale cache data).
     /// The cache dir is typically separate from the sync dir to avoid deleting live data.
     pub paths: Vec<PathPair>,
 
@@ -33,14 +270,16 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct PathPair {
     /// The directory exposed by rclone mount (e.g. /home/user/mounts/project-a).
-    /// ONLY traversed for warming (1-byte read when size is in range, else attributes only). NEVER delete from here.
+    /// ONLY traversed for warming (File contents read when size is in range, else attributes only).
+    /// NEVER delete from here.
     pub sync: String,
     /// The rclone cache directory (from --cache-dir in service unit, e.g. /home/user/.rclone_cache).
     /// Used for on-disk size checks and complete deletion of contents to refresh cache.
     /// Can be shared across multiple sync dirs.
     pub cache: String,
-    /// Optional systemd **user** unit that mounts this sync path (e.g. `rclone-gdrive-project-a.service`).
-    /// When set, startup checks `systemctl --user is-active` and may offer to start an inactive unit.
+    /// Optional systemd unit that mounts this sync path (e.g. `gdrive-project-a.service`).
+    /// Accepts **system** units (`/etc/systemd/system/`) or **user** units (`systemctl --user`).
+    /// When set, startup detects the scope via LoadState, checks `is-active`, and may offer to start.
     #[serde(default)]
     pub service: Option<String>,
 }
@@ -55,16 +294,31 @@ pub struct WalkOptions {
     /// Some(n) = WalkDir::max_depth(n)
     pub max_depth: Option<usize>,
 
-    /// Minimum file size (bytes) eligible for a 1-byte warm read.
+    /// Minimum file size (bytes) eligible for a File contents read when `max_file_size_bytes > 0`.
     /// `0` means no minimum (any size is eligible on the low side).
-    #[serde(default = "default_min_file_size_bytes")]
+    ///
+    /// JSON: integer **or** string with unit (`"64KiB"`, `"64K"`, `"1MB"`, …). Stored as bytes.
+    #[serde(
+        default = "default_min_file_size_bytes",
+        deserialize_with = "deserialize_min_file_size"
+    )]
     pub min_file_size_bytes: u64,
 
-    /// Maximum file size (bytes) eligible for a 1-byte warm read.
-    /// `0` means no maximum (any size is eligible on the high side).
-    /// Files outside the min/max window only have attributes/metadata touched.
-    #[serde(default = "default_max_file_size_bytes")]
-    pub max_file_size_bytes: u64,
+    /// Maximum file size limit for File contents read (bytes after unit expansion).
+    ///
+    /// JSON: integer **or** string with unit (`"64KiB"`, `"64K"`, `"1.5MiB"`, …).
+    ///
+    /// Special values:
+    /// - `-1` — no File contents read; metadata only for every file
+    /// - `0` — File contents read for **all** files (any size; ignores min)
+    /// - `N > 0` — File contents read when size is within min..N
+    ///
+    /// Other negative values are rejected.
+    #[serde(
+        default = "default_max_file_size_bytes",
+        deserialize_with = "deserialize_max_file_size"
+    )]
+    pub max_file_size_bytes: i64,
 
     /// Maximum worker threads for concurrent file warm operations (open/read or metadata).
     /// Default 8. Must be in 1..=64. Spinner shows active/max during the walk.
@@ -86,7 +340,7 @@ impl Default for WalkOptions {
 fn default_min_file_size_bytes() -> u64 {
     0
 }
-fn default_max_file_size_bytes() -> u64 {
+fn default_max_file_size_bytes() -> i64 {
     0
 }
 fn default_max_threads() -> usize {
@@ -268,7 +522,17 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config, String> {
 
     let min = cfg.walk.min_file_size_bytes;
     let max = cfg.walk.max_file_size_bytes;
-    if min != 0 && max != 0 && min > max {
+    // max_file_size_bytes: only -1, 0, or positive byte counts are allowed.
+    if max < -1 {
+        return Err(format!(
+            "configuration error: walk.max_file_size_bytes ({max}) is invalid. \
+             Allowed: -1 (metadata only), 0 (File contents read for all files), \
+             or a size limit as bytes or a unit string (e.g. 65536, \"64KiB\", \"64K\"). \
+             Other negative values are rejected."
+        ));
+    }
+    // When max is a positive upper bound, min must not exceed it.
+    if max > 0 && min != 0 && min > max as u64 {
         return Err(format!(
             "walk.min_file_size_bytes ({min}) cannot be greater than walk.max_file_size_bytes ({max})"
         ));
@@ -402,6 +666,114 @@ mod tests {
             "expected size range error: {}",
             err
         );
+    }
+
+    #[test]
+    fn config_accepts_max_file_size_specials() {
+        let td = TempDir::new().expect("tempdir");
+        let p = td.path().join("config.json");
+        for max in [-1i64, 0, 65536] {
+            let body = format!(
+                r#"{{"paths":[{{"sync":"/abs/one","cache":"/cache/abs"}}],
+                 "walk":{{"max_file_size_bytes":{max}}}}}"#
+            );
+            let mut f = File::create(&p).unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+            let c = load_from_path(&p).expect("load");
+            assert_eq!(c.walk.max_file_size_bytes, max);
+        }
+    }
+
+    #[test]
+    fn config_rejects_other_negative_max_file_size() {
+        let td = TempDir::new().expect("tempdir");
+        let p = td.path().join("config.json");
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],
+                 "walk":{"max_file_size_bytes":-2}}"#,
+            )
+            .unwrap();
+        }
+        let err = load_from_path(&p).unwrap_err();
+        assert!(
+            err.contains("configuration error") && err.contains("max_file_size_bytes"),
+            "expected invalid max error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn config_rejects_bare_fractional_max_file_size() {
+        let td = TempDir::new().expect("tempdir");
+        let p = td.path().join("config.json");
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],
+                 "walk":{"max_file_size_bytes":12.5}}"#,
+            )
+            .unwrap();
+        }
+        let err = load_from_path(&p).unwrap_err();
+        assert!(
+            err.contains("configuration error") || err.contains("invalid JSON"),
+            "expected bare fractional rejection: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_size_expr_units_and_shorthand() {
+        assert_eq!(parse_size_expr("65536").unwrap(), 65536);
+        assert_eq!(parse_size_expr("64KiB").unwrap(), 65536);
+        assert_eq!(parse_size_expr("64kib").unwrap(), 65536);
+        assert_eq!(parse_size_expr("64K").unwrap(), 65536);
+        assert_eq!(parse_size_expr("64k").unwrap(), 65536);
+        assert_eq!(parse_size_expr("64 KB").unwrap(), 65536);
+        assert_eq!(parse_size_expr("1MiB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size_expr("1mb").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size_expr("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size_expr("512B").unwrap(), 512);
+        assert_eq!(parse_size_expr("512b").unwrap(), 512);
+        assert_eq!(parse_size_expr("1.5KiB").unwrap(), 1536);
+        assert_eq!(parse_size_expr("-1").unwrap(), -1);
+        assert!(parse_size_expr("-2").is_err());
+        assert!(parse_size_expr("10XB").is_err());
+    }
+
+    #[test]
+    fn config_accepts_string_size_units() {
+        let td = TempDir::new().expect("tempdir");
+        let p = td.path().join("config.json");
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],
+                 "walk":{"min_file_size_bytes":"1K","max_file_size_bytes":"64KiB"}}"#,
+            )
+            .unwrap();
+        }
+        let c = load_from_path(&p).expect("load unit strings");
+        assert_eq!(c.walk.min_file_size_bytes, 1024);
+        assert_eq!(c.walk.max_file_size_bytes, 65536);
+    }
+
+    #[test]
+    fn config_accepts_string_minus_one() {
+        let td = TempDir::new().expect("tempdir");
+        let p = td.path().join("config.json");
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],
+                 "walk":{"max_file_size_bytes":"-1"}}"#,
+            )
+            .unwrap();
+        }
+        let c = load_from_path(&p).expect("load -1 string");
+        assert_eq!(c.walk.max_file_size_bytes, -1);
     }
 
     #[test]

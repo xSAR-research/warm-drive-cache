@@ -10,54 +10,115 @@
 //! is skipped — cache warming would not help an unmounted tree.
 
 use crate::cache_ops;
-use crate::config::{Config, PathPair};
+use crate::config::{Config, MountWait, PathPair};
+use crate::mount_wait;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Run service status, optional start prompt, and permission probes for one pair.
+/// Whether a unit is managed by system systemd or the per-user instance.
+///
+/// rclone mounts may be either:
+/// - **system** units under `/etc/systemd/system/` (common when installed with
+///   `User=` in the unit and enabled for multi-user.target)
+/// - **user** units under `~/.config/systemd/user/` (`systemctl --user`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemdScope {
+    System,
+    User,
+}
+
+impl SystemdScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+        }
+    }
+
+    /// Extra argv before the systemctl verb (`--user` or nothing).
+    fn flag(self) -> &'static [&'static str] {
+        match self {
+            Self::System => &[],
+            Self::User => &["--user"],
+        }
+    }
+}
+
+/// Run service status, optional start prompt, settle wait, and permission probes for one pair.
 ///
 /// Returns `true` when main may delete/warm this pair.
 /// Call **before** installing raw-mode quit handlers so Y/n prompts use normal stdin.
-pub fn check_path_pair(pair: &PathPair, dry_run: bool) -> bool {
-    println!("\n🔎 Pre-flight checks");
-    println!("   sync:  {}", pair.sync);
-    println!("   cache: {}", pair.cache);
+///
+/// When `verbose` is false, successful pre-flight detail is suppressed; failures and
+/// interactive start prompts are always shown.
+pub fn check_path_pair(
+    pair: &PathPair,
+    dry_run: bool,
+    verbose: bool,
+    mount_wait_cfg: &MountWait,
+) -> bool {
+    if verbose {
+        println!("\n🔎 Pre-flight checks");
+        println!("   sync:  {}", pair.sync);
+        println!("   cache: {}", pair.cache);
+    }
+
     if let Some(svc) = pair
         .service
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        println!("   unit:  {svc} (systemd --user)");
-        match ensure_service_ready(svc, dry_run) {
-            Ok(true) => {}
-            Ok(false) => {
-                println!();
-                println!(
-                    "   ⛔ Service not operational — cache warmer will not run for this pair."
-                );
-                println!(
-                    "   Reason: unit is inactive and was not started; warming an unmounted \
-                     tree has no benefit."
-                );
-                return false;
+        match resolve_unit_scope(svc) {
+            Ok(scope) => {
+                if verbose {
+                    println!("   unit:  {svc} (systemd {})", scope.label());
+                }
+                match ensure_service_ready(svc, scope, dry_run, verbose) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        println!();
+                        println!(
+                            "   ⛔ Service not operational — cache warmer will not run for this pair."
+                        );
+                        println!(
+                            "   Reason: unit is inactive and was not started; warming an unmounted \
+                             tree has no benefit."
+                        );
+                        return false;
+                    }
+                    Err(e) => {
+                        println!("   ⚠️  systemd check failed: {e}");
+                        // Still attempt FS checks; user may have a manual mount.
+                    }
+                }
             }
             Err(e) => {
-                println!("   ⚠️  systemd check failed: {e}");
+                if verbose {
+                    println!("   unit:  {svc}");
+                }
+                println!("   ⚠️  systemd: {e}");
                 // Still attempt FS checks; user may have a manual mount.
             }
         }
-    } else {
+    } else if verbose {
         println!("   unit:  (none configured — skipping systemd checks)");
     }
+
+    // Service enable/active must complete before mount settle.
+    let _ = mount_wait::wait_for_mount_content(Path::new(&pair.sync), mount_wait_cfg, verbose);
 
     let mut ok = true;
 
     match check_sync_readable(Path::new(&pair.sync)) {
-        Ok(msg) => println!("   ✓ sync access: {msg}"),
+        Ok(msg) => {
+            if verbose {
+                println!("   ✓ sync access: {msg}");
+            }
+        }
         Err(e) => {
             println!("   ✗ sync access: {e}");
             ok = false;
@@ -65,7 +126,11 @@ pub fn check_path_pair(pair: &PathPair, dry_run: bool) -> bool {
     }
 
     match check_cache_permissions(Path::new(&pair.cache)) {
-        Ok(msg) => println!("   ✓ cache access: {msg}"),
+        Ok(msg) => {
+            if verbose {
+                println!("   ✓ cache access: {msg}");
+            }
+        }
         Err(e) => {
             println!("   ✗ cache access: {e}");
             ok = false;
@@ -79,7 +144,11 @@ pub fn check_path_pair(pair: &PathPair, dry_run: bool) -> bool {
         .filter(|s| !s.is_empty())
     {
         match check_unit_file_permissions(svc) {
-            Ok(msg) => println!("   ✓ unit file: {msg}"),
+            Ok(msg) => {
+                if verbose {
+                    println!("   ✓ unit file: {msg}");
+                }
+            }
             Err(e) => {
                 println!("   ⚠️  unit file: {e}");
             }
@@ -95,47 +164,92 @@ pub fn check_path_pair(pair: &PathPair, dry_run: bool) -> bool {
         return false;
     }
 
-    println!("   ✓ Pre-flight OK — proceeding with cache maintenance for this pair.");
+    if verbose {
+        println!("   ✓ Pre-flight OK — proceeding with cache maintenance for this pair.");
+    }
     true
 }
 
-/// Ensure the user unit is active; if not, ask (or simulate in dry-run) to start it.
+/// Ensure the unit is active; if not, ask (or simulate in dry-run) to start it.
+///
+/// On user-confirmed start: `daemon-reload` → `enable` → `start`, then verify
+/// **enabled** and **active** (before any mount settle wait). System units retry
+/// with `sudo` when permission is denied.
+///
 /// Returns Ok(true) if active (or started), Ok(false) if inactive and user declined.
-fn ensure_service_ready(unit: &str, dry_run: bool) -> Result<bool, String> {
-    let active = is_user_unit_active(unit)?;
+fn ensure_service_ready(
+    unit: &str,
+    scope: SystemdScope,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<bool, String> {
+    let active = is_unit_active(unit, scope)?;
     if active {
-        println!("   ✓ systemd: {unit} is active");
+        if verbose {
+            let en = is_unit_enabled(unit, scope).unwrap_or(false);
+            println!(
+                "   ✓ systemd ({}): {unit} is active{}",
+                scope.label(),
+                if en { " and enabled" } else { "" }
+            );
+        }
         return Ok(true);
     }
 
-    println!("   ⚠️  systemd: {unit} is not active");
+    // Always surface inactive state (needs a decision).
+    println!(
+        "   ⚠️  systemd ({}): {unit} is not active",
+        scope.label()
+    );
 
     if dry_run {
         println!("   --dry-run: would ask to start {unit}; treating as skip for live warm path");
         return Ok(false);
     }
 
-    if !prompt_yes_no(&format!("   Start user unit {unit} now? [Y/n] ")) {
+    let start_hint = match scope {
+        SystemdScope::User => format!("Start user unit {unit} now? [Y/n] "),
+        SystemdScope::System => {
+            format!("Start system unit {unit} now? (may require sudo) [Y/n] ")
+        }
+    };
+    if !prompt_yes_no(&format!("   {start_hint}")) {
         return Ok(false);
     }
 
-    println!("   … starting {unit} via systemctl --user start …");
-    start_user_unit(unit)?;
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    if is_user_unit_active(unit)? {
-        println!("   ✓ systemd: {unit} is now active");
-        Ok(true)
-    } else {
-        Err(format!(
-            "started {unit} but is-active still reports inactive (check journalctl --user -u {unit})"
-        ))
+    println!(
+        "   … systemd {}: daemon-reload, enable, start for {unit} …",
+        scope.label()
+    );
+    daemon_reload(scope)?;
+    enable_unit(unit, scope)?;
+    start_unit(unit, scope)?;
+
+    // Verify enabled + active before any settle/wait section.
+    let enabled = is_unit_enabled(unit, scope)?;
+    let active_now = is_unit_active(unit, scope)?;
+    if enabled && active_now {
+        println!(
+            "   ✓ systemd ({}): {unit} is enabled and active",
+            scope.label()
+        );
+        return Ok(true);
     }
+
+    let journal = match scope {
+        SystemdScope::User => format!("journalctl --user -u {unit}"),
+        SystemdScope::System => format!("journalctl -u {unit}"),
+    };
+    Err(format!(
+        "after enable/start, {unit} is enabled={enabled} active={active_now} \
+         (check {journal}; system units may need sudo / polkit)"
+    ))
 }
 
 /// `-c` / `--check`: validate loaded config layout and print a clear report per service.
 ///
 /// For each path pair, groups:
-/// - service name (systemd user unit)
+/// - service name (systemd system or user unit)
 /// - file directory (`sync` mount path from config)
 /// - cache path from the unit's `--cache-dir` (falls back to config `cache` with a warning)
 /// - current on-disk size of that cache directory
@@ -152,8 +266,8 @@ pub fn run_config_check(cfg: &Config) -> bool {
     println!(
         "Walk:            max_depth={:?}  min_size={}  max_size={}  max_threads={}",
         cfg.walk.max_depth,
-        cfg.walk.min_file_size_bytes,
-        cfg.walk.max_file_size_bytes,
+        cache_ops::format_bytes(cfg.walk.min_file_size_bytes),
+        cache_ops::format_max_file_size_limit(cfg.walk.max_file_size_bytes),
         cfg.walk.max_threads
     );
     println!("Ignore names:    {:?}", cfg.ignore.names);
@@ -237,10 +351,13 @@ pub fn run_config_check(cfg: &Config) -> bool {
         }
 
         if !service.starts_with('(') {
-            match is_user_unit_active(service) {
-                Ok(true) => println!("  systemd:  active"),
-                Ok(false) => println!("  systemd:  inactive"),
-                Err(e) => println!("  systemd:  (check failed: {e})"),
+            match resolve_unit_scope(service) {
+                Ok(scope) => match is_unit_active(service, scope) {
+                    Ok(true) => println!("  systemd:  active ({})", scope.label()),
+                    Ok(false) => println!("  systemd:  inactive ({})", scope.label()),
+                    Err(e) => println!("  systemd:  (check failed: {e})"),
+                },
+                Err(e) => println!("  systemd:  (not found: {e})"),
             }
         }
         println!();
@@ -257,12 +374,11 @@ pub fn run_config_check(cfg: &Config) -> bool {
     all_ok
 }
 
-/// Read the user unit definition and extract the rclone `--cache-dir` path.
+/// Read the unit definition (system or user) and extract the rclone `--cache-dir` path.
 pub fn extract_cache_dir_from_unit(unit: &str) -> Result<String, String> {
-    let out = Command::new("systemctl")
-        .args(["--user", "cat", unit])
-        .output()
-        .map_err(|e| format!("systemctl --user cat {unit}: {e}"))?;
+    let scope = resolve_unit_scope(unit)?;
+    let out = systemctl_output(scope, &["cat", unit])
+        .map_err(|e| format!("systemctl {} cat {unit}: {e}", scope.label()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let detail = stderr.trim();
@@ -271,7 +387,10 @@ pub fn extract_cache_dir_from_unit(unit: &str) -> Result<String, String> {
         } else {
             detail
         };
-        return Err(format!("cannot read unit {unit}: {detail}"));
+        return Err(format!(
+            "cannot read {} unit {unit}: {detail}",
+            scope.label()
+        ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     parse_cache_dir_flag(&text).ok_or_else(|| format!("no --cache-dir found in unit {unit}"))
@@ -305,41 +424,163 @@ pub fn parse_cache_dir_flag(text: &str) -> Option<String> {
     None
 }
 
-fn is_user_unit_active(unit: &str) -> Result<bool, String> {
-    let out = Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", unit])
-        .status()
-        .map_err(|e| {
-            format!("cannot run systemctl --user (is systemd user session available?): {e}")
-        })?;
-    Ok(out.success())
+/// Resolve whether `unit` is a system or user unit via `LoadState`.
+///
+/// Prefers the scope where `LoadState=loaded`. If both are loaded (rare),
+/// prefers the scope that is currently active, then system.
+fn resolve_unit_scope(unit: &str) -> Result<SystemdScope, String> {
+    let system_loaded = unit_load_state(unit, SystemdScope::System)
+        .map(|s| s == "loaded")
+        .unwrap_or(false);
+    let user_loaded = unit_load_state(unit, SystemdScope::User)
+        .map(|s| s == "loaded")
+        .unwrap_or(false);
+
+    match (system_loaded, user_loaded) {
+        (true, false) => Ok(SystemdScope::System),
+        (false, true) => Ok(SystemdScope::User),
+        (true, true) => {
+            // Prefer whichever is currently active; default to system.
+            if is_unit_active(unit, SystemdScope::System).unwrap_or(false) {
+                Ok(SystemdScope::System)
+            } else if is_unit_active(unit, SystemdScope::User).unwrap_or(false) {
+                Ok(SystemdScope::User)
+            } else {
+                Ok(SystemdScope::System)
+            }
+        }
+        (false, false) => Err(format!(
+            "unit {unit} not found as a system or user unit \
+             (check the name; drop a mistaken rclone- prefix if the unit is gdrive-*.service)"
+        )),
+    }
 }
 
-fn start_user_unit(unit: &str) -> Result<(), String> {
-    let out = Command::new("systemctl")
-        .args(["--user", "start", unit])
-        .output()
-        .map_err(|e| format!("systemctl --user start failed to spawn: {e}"))?;
-    if out.status.success() {
-        return Ok(());
+fn unit_load_state(unit: &str, scope: SystemdScope) -> Result<String, String> {
+    let out = systemctl_output(scope, &["show", "-p", "LoadState", "--value", unit])
+        .map_err(|e| format!("systemctl {} show LoadState: {e}", scope.label()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "systemctl {} show LoadState failed for {unit}",
+            scope.label()
+        ));
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn is_unit_active(unit: &str, scope: SystemdScope) -> Result<bool, String> {
+    let status = systemctl_status(scope, &["is-active", "--quiet", unit]).map_err(|e| {
+        format!(
+            "cannot run systemctl {} is-active (is systemd available?): {e}",
+            scope.label()
+        )
+    })?;
+    Ok(status.success())
+}
+
+fn is_unit_enabled(unit: &str, scope: SystemdScope) -> Result<bool, String> {
+    // is-enabled: 0 = enabled (or enabled-runtime / static treated as success for --quiet varies).
+    // Use non-quiet and accept "enabled" / "enabled-runtime" / "static" / "alias" as OK.
+    let out = systemctl_output(scope, &["is-enabled", unit]).map_err(|e| {
+        format!(
+            "cannot run systemctl {} is-enabled: {e}",
+            scope.label()
+        )
+    })?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let ok = matches!(
+        text.as_str(),
+        "enabled" | "enabled-runtime" | "static" | "indirect" | "generated" | "alias"
+    ) || out.status.success();
+    Ok(ok)
+}
+
+fn daemon_reload(scope: SystemdScope) -> Result<(), String> {
+    systemctl_mut(scope, &["daemon-reload"]).map(|_| ())
+}
+
+fn enable_unit(unit: &str, scope: SystemdScope) -> Result<(), String> {
+    systemctl_mut(scope, &["enable", unit]).map(|_| ())
+}
+
+fn start_unit(unit: &str, scope: SystemdScope) -> Result<(), String> {
+    systemctl_mut(scope, &["start", unit]).map(|_| ())
+}
+
+/// Read-only / status systemctl (no sudo).
+fn systemctl_output(scope: SystemdScope, args: &[&str]) -> io::Result<std::process::Output> {
+    let mut cmd = Command::new("systemctl");
+    cmd.args(scope.flag());
+    cmd.args(args);
+    cmd.output()
+}
+
+fn systemctl_status(scope: SystemdScope, args: &[&str]) -> io::Result<std::process::ExitStatus> {
+    let mut cmd = Command::new("systemctl");
+    cmd.args(scope.flag());
+    cmd.args(args);
+    cmd.status()
+}
+
+/// Mutating systemctl: try as current user; for **system** units retry with `sudo` on failure.
+fn systemctl_mut(scope: SystemdScope, args: &[&str]) -> Result<std::process::Output, String> {
+    let out = systemctl_output(scope, args).map_err(|e| {
+        format!(
+            "systemctl {} {} failed to spawn: {e}",
+            scope.label(),
+            args.join(" ")
+        )
+    })?;
+    if out.status.success() {
+        return Ok(out);
+    }
+
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if matches!(scope, SystemdScope::System) {
+        println!(
+            "   … elevating with sudo for: systemctl {} …",
+            args.join(" ")
+        );
+        let mut cmd = Command::new("sudo");
+        cmd.arg("systemctl");
+        cmd.args(args);
+        let out2 = cmd.output().map_err(|e| {
+            format!(
+                "sudo systemctl {} failed to spawn (is sudo available?): {e}",
+                args.join(" ")
+            )
+        })?;
+        if out2.status.success() {
+            return Ok(out2);
+        }
+        let stderr2 = String::from_utf8_lossy(&out2.stderr).trim().to_string();
+        return Err(format!(
+            "systemctl {} failed (exit {:?}): {stderr}; sudo retry (exit {:?}): {stderr2}",
+            args.join(" "),
+            out.status.code(),
+            out2.status.code()
+        ));
+    }
+
     Err(format!(
-        "systemctl --user start {unit} failed (exit {:?}): {}",
-        out.status.code(),
-        stderr.trim()
+        "systemctl --user {} failed (exit {:?}): {stderr}",
+        args.join(" "),
+        out.status.code()
     ))
 }
 
 /// Resolve unit file path and check that the file and its parent directory are readable.
 fn check_unit_file_permissions(unit: &str) -> Result<String, String> {
-    let out = Command::new("systemctl")
-        .args(["--user", "show", "-p", "FragmentPath", "--value", unit])
-        .output()
-        .map_err(|e| format!("systemctl show FragmentPath: {e}"))?;
+    let scope = resolve_unit_scope(unit)?;
+    let out = systemctl_output(
+        scope,
+        &["show", "-p", "FragmentPath", "--value", unit],
+    )
+    .map_err(|e| format!("systemctl {} show FragmentPath: {e}", scope.label()))?;
     if !out.status.success() {
         return Err(format!(
-            "could not resolve unit path for {unit} (not installed?)"
+            "could not resolve unit path for {unit} (not installed as {} unit?)",
+            scope.label()
         ));
     }
     let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -366,7 +607,7 @@ fn check_unit_file_permissions(unit: &str) -> Result<String, String> {
     let _ = f
         .read(&mut buf)
         .map_err(|e| permission_message("service unit file", &path, e, "read"))?;
-    Ok(format!("readable ({path_str})"))
+    Ok(format!("readable ({path_str}, {} scope)", scope.label()))
 }
 
 /// Sync tree must exist as a directory and allow listing (read access).

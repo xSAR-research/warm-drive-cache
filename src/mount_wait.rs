@@ -56,14 +56,18 @@ pub fn sleep_capped_with_budget(start: &Instant, requested: u64, max_wait: u64) 
 }
 
 /// Wait for an rclone FUSE mount to populate before walking.
-#[allow(dead_code)]
-pub fn wait_for_mount_content(path: &Path, wait: &MountWait) -> bool {
+///
+/// When `verbose` is false, progress lines are suppressed; warnings still print
+/// if the wait times out or the directory stays empty.
+pub fn wait_for_mount_content(path: &Path, wait: &MountWait, verbose: bool) -> bool {
     let start = Instant::now();
 
-    println!(
-        "   ⏳ Path exists — waiting {}s for mount to settle (max {}s total)...",
-        wait.initial_secs, wait.max_wait_secs
-    );
+    if verbose {
+        println!(
+            "   ⏳ Path exists — waiting {}s for mount to settle (max {}s total)...",
+            wait.initial_secs, wait.max_wait_secs
+        );
+    }
     if !sleep_capped_with_budget(&start, wait.initial_secs, wait.max_wait_secs) {
         eprintln!(
             "   ⚠️  Max wait timeout ({}s) reached — proceeding anyway.",
@@ -73,11 +77,15 @@ pub fn wait_for_mount_content(path: &Path, wait: &MountWait) -> bool {
     }
 
     if directory_has_content(path) {
-        println!("   ✓ Directory has content, starting walk.");
+        if verbose {
+            println!("   ✓ Directory has content, starting walk.");
+        }
         return true;
     }
 
-    println!("   ⏳ Directory looks empty (mount may still be populating)...");
+    if verbose {
+        println!("   ⏳ Directory looks empty (mount may still be populating)...");
+    }
 
     for (attempt, &delay) in wait.retry_delays_secs.iter().enumerate() {
         if start.elapsed().as_secs() >= wait.max_wait_secs {
@@ -88,12 +96,14 @@ pub fn wait_for_mount_content(path: &Path, wait: &MountWait) -> bool {
             return directory_has_content(path);
         }
 
-        println!(
-            "   ⏳ Retry {}/{}: waiting {}s...",
-            attempt + 1,
-            wait.retry_delays_secs.len(),
-            delay
-        );
+        if verbose {
+            println!(
+                "   ⏳ Retry {}/{}: waiting {}s...",
+                attempt + 1,
+                wait.retry_delays_secs.len(),
+                delay
+            );
+        }
         if !sleep_capped_with_budget(&start, delay, wait.max_wait_secs) {
             eprintln!(
                 "   ⚠️  Max wait timeout ({}s) reached — proceeding anyway.",
@@ -103,7 +113,9 @@ pub fn wait_for_mount_content(path: &Path, wait: &MountWait) -> bool {
         }
 
         if directory_has_content(path) {
-            println!("   ✓ Directory now has content, starting walk.");
+            if verbose {
+                println!("   ✓ Directory now has content, starting walk.");
+            }
             return true;
         }
     }

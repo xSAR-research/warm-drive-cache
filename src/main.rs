@@ -13,6 +13,7 @@
 //! - [`shutdown`] — SIGINT / TTY `q` graceful stop
 //! - [`cache_ops`] — cache size + non-interactive delete
 //! - [`worker`] — parallel sync-tree warm (READ / ATTR)
+//! - [`warm_log`] — optional `/tmp` CSV log (`-l` / `--log`)
 //! - [`cleanup`] — end-of-run summary, thanks, GitHub issues link
 //! - [`mount_wait`] — optional FUSE settle helpers
 
@@ -23,6 +24,7 @@ mod config;
 mod mount_wait;
 mod shutdown;
 mod startup;
+mod warm_log;
 mod worker;
 
 use std::path::Path;
@@ -30,12 +32,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn main() {
-    // Early CLI: -h/--help, -v/--version, -c/--check exit before (or without) maintenance.
+    // Early CLI: -h/--help, -i/--information, -c/--check exit before (or without) maintenance.
     match startup::parse_cli_args(std::env::args().skip(1)) {
         startup::CliAction::Help => startup::print_help(),
-        startup::CliAction::Version => startup::print_version(),
+        startup::CliAction::Information => startup::print_information(),
         startup::CliAction::Check => run_check(),
-        startup::CliAction::Run { dry_run } => run(dry_run),
+        startup::CliAction::Run {
+            dry_run,
+            verbose,
+            log,
+        } => run(dry_run, verbose, log),
     }
 }
 
@@ -45,7 +51,7 @@ fn run_check() {
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("❌ warm-drive-cache config error: {}", e);
+            eprintln!("❌ warm-drive-cache configuration error: {}", e);
             eprintln!(
                 "   Place config.json next to the executable, or set WARM_DRIVE_CACHE_CONFIG."
             );
@@ -65,7 +71,7 @@ fn run_check() {
     }
 }
 
-fn run(dry_run: bool) {
+fn run(dry_run: bool, verbose: bool, log: bool) {
     // Banner: product of xSAR, website, AGPL-3.0-only (baked from Cargo.toml).
     startup::print_startup_banner();
 
@@ -73,7 +79,7 @@ fn run(dry_run: bool) {
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("❌ warm-drive-cache config error: {}", e);
+            eprintln!("❌ warm-drive-cache configuration error: {}", e);
             eprintln!("   Typical location: config.json next to the binary (run directory)");
             eprintln!(
                 "   Copy from config.example.json and set your local paths (config.json is gitignored)."
@@ -96,7 +102,25 @@ fn run(dry_run: bool) {
         std::process::exit(1);
     }
 
-    startup::print_loaded_config(&cfg);
+    if verbose {
+        startup::print_loaded_config(&cfg);
+    }
+
+    let warm_log = if log {
+        match warm_log::WarmLog::create() {
+            Ok(l) => {
+                println!("   CSV log: {}", l.path().display());
+                Some(Arc::new(l))
+            }
+            Err(e) => {
+                eprintln!("❌ warm-drive-cache log error: {e}");
+                cleanup::print_exit_summary(false);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let shutdown = Arc::new(AtomicBool::new(false));
     // Installed after interactive pre-flight prompts so Y/n uses cooked stdin.
@@ -108,8 +132,8 @@ fn run(dry_run: bool) {
             break;
         }
 
-        // Service status, optional start, sync/cache/unit permission probes.
-        if !cache_check::check_path_pair(pair, dry_run) {
+        // Service status, optional start (daemon-reload/enable/active), settle, permission probes.
+        if !cache_check::check_path_pair(pair, dry_run, verbose, &cfg.mount_wait) {
             continue;
         }
 
@@ -130,7 +154,10 @@ fn run(dry_run: bool) {
         if dry_run {
             println!("   --dry-run enabled: simulating full deletion (no changes made)");
             let _ = cache_ops::delete_dir_contents(cache_path, true);
-            println!("   After size (simulated, cache): 0 bytes");
+            println!(
+                "   After size (simulated, cache): {}",
+                cache_ops::format_bytes(0)
+            );
             continue;
         }
 
@@ -149,9 +176,24 @@ fn run(dry_run: bool) {
 
         println!(
             "   Walking sync dir (max_threads={}, min_size={}, max_size={})...",
-            cfg.walk.max_threads, cfg.walk.min_file_size_bytes, cfg.walk.max_file_size_bytes
+            cfg.walk.max_threads,
+            cache_ops::format_bytes(cfg.walk.min_file_size_bytes),
+            cache_ops::format_max_file_size_limit(cfg.walk.max_file_size_bytes)
         );
-        let mut status = worker::warm_tree(sync_path, &cfg, &shutdown);
+        println!();
+        let service_name = pair
+            .service
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        let mut status = worker::warm_tree(
+            sync_path,
+            &cfg,
+            &shutdown,
+            service_name,
+            warm_log.as_ref(),
+        );
         status.finish_line();
 
         let after_warm = cache_ops::dir_size(cache_path);
@@ -161,7 +203,7 @@ fn run(dry_run: bool) {
         );
         println!("   Directories processed: {}", status.dirs);
         println!("   Files processed: {}", status.files);
-        println!("   1-byte reads: {}", status.byte_reads);
+        println!("   File contents read: {}", status.byte_reads);
         println!("   Metadata-only: {}", status.metadata_only);
         println!("   Errors: {}", status.errors);
         if status.cancelled {
@@ -173,5 +215,16 @@ fn run(dry_run: bool) {
 
     // Keep guard alive until here (Drop restores termios).
     drop(stdin_guard);
+
+    if let Some(ref log) = warm_log {
+        let _ = log.flush();
+    }
+
     cleanup::print_exit_summary(shutdown.load(Ordering::SeqCst));
+
+    // After the normal exit summary: blank line then CSV path when logging was enabled.
+    if let Some(ref log) = warm_log {
+        println!();
+        println!("CSV log written to: {}", log.path().display());
+    }
 }

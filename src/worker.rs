@@ -3,6 +3,8 @@
 //! Directory listings stay on the walker thread; file open/read runs on a bounded pool.
 
 use crate::config::Config;
+use crate::warm_log::WarmLog;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsStr;
@@ -40,9 +42,9 @@ pub fn truncate_display(s: &str, max_chars: usize) -> String {
 pub enum ThreadWorkMode {
     /// Waiting for the next path from the queue.
     Idle,
-    /// File size is inside the configured window — performing a 1-byte warm read.
+    /// File size is inside the configured window — File contents read (single-byte open).
     ByteRead,
-    /// File size is outside the window — attributes/metadata only (no 1-byte read).
+    /// File size is outside the window — attributes/metadata only (no File contents read).
     AttrOnly,
 }
 
@@ -134,7 +136,7 @@ fn format_thread_slot_line(
         ThreadWorkMode::AttrOnly => {
             let name = truncate_display(&slot.path, DISPLAY_PATH_MAX_CHARS);
             let sz = format_bytes_compact(slot.size);
-            // Outside min/max 1-byte window: size + attributes-only (no 1-byte read).
+            // Outside size window: attributes-only (no File contents read).
             format!("   {thr:<8}  {sz:>8}  ATTR  {name}")
         }
     }
@@ -268,7 +270,7 @@ impl WalkStatus {
     }
 }
 
-/// Outcome of warming a single file (1-byte read vs attributes-only).
+/// Outcome of warming a single file (File contents read vs attributes-only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WarmOutcome {
     ByteRead,
@@ -276,26 +278,62 @@ pub enum WarmOutcome {
     Error,
 }
 
-/// Whether `len` falls inside the configured 1-byte-read window.
-/// `min == 0` means no lower bound; `max == 0` means no upper bound.
-pub fn should_read_one_byte(len: u64, min: u64, max: u64) -> bool {
+/// Whether this file should get a **File contents read** under the size policy.
+///
+/// `max_file_size_bytes` semantics:
+/// - `-1` — never (metadata only)
+/// - `0` — always (all sizes; ignores `min`)
+/// - `N > 0` — when `len` is within `[min, N]` (`min == 0` means no lower bound)
+pub fn should_read_file_contents(len: u64, min: u64, max: i64) -> bool {
+    if max < 0 {
+        // -1 (and any other negative after validation) → metadata only
+        return false;
+    }
+    if max == 0 {
+        return true;
+    }
+    let max_u = max as u64;
     if min != 0 && len < min {
         return false;
     }
-    if max != 0 && len > max {
+    if len > max_u {
         return false;
     }
     true
 }
 
-/// Warm one file: 1-byte read when size is in range, otherwise attributes only.
+/// Write one CSV row for a warmed file (best-effort; errors print a warning).
+fn log_warm_row(
+    log: &WarmLog,
+    service: &str,
+    path: &Path,
+    size: Option<u64>,
+    status: &str,
+) {
+    let Some(size) = size else {
+        return;
+    };
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if let Err(e) = log.log_file(service, &dir, &filename, size, status) {
+        eprintln!("   ⚠️  warm log write failed for {}: {e}", path.display());
+    }
+}
+
+/// Warm one file: File contents read when size policy allows, otherwise attributes only.
 ///
 /// When `on_classified` is provided, it is called after size is known and before
 /// open/read so the live spinner can show path, size, and READ vs ATTR mode.
 pub fn warm_file_with_hook(
     path: &Path,
     min: u64,
-    max: u64,
+    max: i64,
     on_classified: Option<&dyn Fn(u64, ThreadWorkMode)>,
 ) -> WarmOutcome {
     let meta = match fs::symlink_metadata(path) {
@@ -303,8 +341,8 @@ pub fn warm_file_with_hook(
         Err(_) => return WarmOutcome::Error,
     };
     let len = meta.len();
-    let in_range = should_read_one_byte(len, min, max);
-    let mode = if in_range {
+    let do_read = should_read_file_contents(len, min, max);
+    let mode = if do_read {
         ThreadWorkMode::ByteRead
     } else {
         ThreadWorkMode::AttrOnly
@@ -313,7 +351,7 @@ pub fn warm_file_with_hook(
         hook(len, mode);
     }
 
-    if !in_range {
+    if !do_read {
         // Attributes already loaded via symlink_metadata — skip open/read for large blobs etc.
         return WarmOutcome::MetadataOnly;
     }
@@ -321,11 +359,10 @@ pub fn warm_file_with_hook(
     match fs::File::open(path) {
         Ok(mut f) => {
             let mut buf = [0u8; 1];
-            // 0 bytes = empty file (open still warms); 1 byte = normal warm read.
+            // Empty file: open still warms; otherwise a single-byte File contents read.
             match f.read(&mut buf) {
                 Ok(0 | 1) => WarmOutcome::ByteRead,
                 Ok(n) => {
-                    // 1-byte buffer: more than 1 is impossible, treat as warm success.
                     debug_assert!(n <= 1);
                     WarmOutcome::ByteRead
                 }
@@ -350,7 +387,15 @@ pub fn warm_file_with_hook(
 ///
 /// On `shutdown` (SIGINT / `q`): stop enqueueing and discard queued work that has
 /// not started; in-flight workers finish their current file, then exit.
-pub fn warm_tree(sync_path: &Path, cfg: &Config, shutdown: &Arc<AtomicBool>) -> WalkStatus {
+///
+/// When `log` is set, each successful warm writes a CSV row (`READ` or `ATTRIB`).
+pub fn warm_tree(
+    sync_path: &Path,
+    cfg: &Config,
+    shutdown: &Arc<AtomicBool>,
+    service_name: &str,
+    log: Option<&Arc<WarmLog>>,
+) -> WalkStatus {
     let max_threads = cfg.walk.max_threads.max(1);
     let min_size = cfg.walk.min_file_size_bytes;
     let max_size = cfg.walk.max_file_size_bytes;
@@ -370,6 +415,8 @@ pub fn warm_tree(sync_path: &Path, cfg: &Config, shutdown: &Arc<AtomicBool>) -> 
     let slots = Arc::clone(&status.slots);
     let ignore_names: HashSet<&OsStr> = cfg.ignore.names.iter().map(OsStr::new).collect();
     let sync_root = sync_path.to_path_buf();
+    let service_name = service_name.to_string();
+    let log = log.cloned();
 
     thread::scope(|scope| {
         for worker_id in 0..max_threads {
@@ -383,6 +430,8 @@ pub fn warm_tree(sync_path: &Path, cfg: &Config, shutdown: &Arc<AtomicBool>) -> 
             let slots = Arc::clone(&slots);
             let shutdown = Arc::clone(shutdown);
             let sync_root = sync_root.clone();
+            let service_name = service_name.clone();
+            let log = log.clone();
 
             scope.spawn(move || {
                 loop {
@@ -433,11 +482,13 @@ pub fn warm_tree(sync_path: &Path, cfg: &Config, shutdown: &Arc<AtomicBool>) -> 
                             let display_path =
                                 shorten_path_for_display(&path, &[sync_root.as_path()]);
                             let slots_for_hook = Arc::clone(&slots);
+                            let seen_size = Cell::new(None::<u64>);
                             let outcome = warm_file_with_hook(
                                 &path,
                                 min_size,
                                 max_size,
                                 Some(&|size, mode| {
+                                    seen_size.set(Some(size));
                                     if let Ok(mut slots) = slots_for_hook.lock()
                                         && let Some(slot) = slots.get_mut(worker_id)
                                     {
@@ -452,9 +503,21 @@ pub fn warm_tree(sync_path: &Path, cfg: &Config, shutdown: &Arc<AtomicBool>) -> 
                             match outcome {
                                 WarmOutcome::ByteRead => {
                                     byte_reads.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(ref log) = log {
+                                        log_warm_row(log, &service_name, &path, seen_size.get(), "READ");
+                                    }
                                 }
                                 WarmOutcome::MetadataOnly => {
                                     metadata_only.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(ref log) = log {
+                                        log_warm_row(
+                                            log,
+                                            &service_name,
+                                            &path,
+                                            seen_size.get(),
+                                            "ATTRIB",
+                                        );
+                                    }
                                 }
                                 WarmOutcome::Error => {
                                     errors.fetch_add(1, Ordering::Relaxed);
@@ -680,28 +743,30 @@ mod tests {
     }
 
     #[test]
-    fn should_read_one_byte_both_zero_allows_any_size() {
-        assert!(should_read_one_byte(0, 0, 0));
-        assert!(should_read_one_byte(u64::MAX, 0, 0));
+    fn should_read_file_contents_zero_means_all() {
+        assert!(should_read_file_contents(0, 0, 0));
+        assert!(should_read_file_contents(u64::MAX, 0, 0));
+        // max 0 ignores min
+        assert!(should_read_file_contents(1, 100, 0));
     }
 
     #[test]
-    fn should_read_one_byte_max_only() {
-        assert!(should_read_one_byte(5120, 0, 5120));
-        assert!(!should_read_one_byte(5121, 0, 5120));
+    fn should_read_file_contents_minus_one_is_metadata_only() {
+        assert!(!should_read_file_contents(0, 0, -1));
+        assert!(!should_read_file_contents(u64::MAX, 0, -1));
     }
 
     #[test]
-    fn should_read_one_byte_min_only() {
-        assert!(!should_read_one_byte(9, 10, 0));
-        assert!(should_read_one_byte(10, 10, 0));
+    fn should_read_file_contents_max_only() {
+        assert!(should_read_file_contents(5120, 0, 5120));
+        assert!(!should_read_file_contents(5121, 0, 5120));
     }
 
     #[test]
-    fn should_read_one_byte_min_and_max() {
-        assert!(!should_read_one_byte(4, 5, 100));
-        assert!(should_read_one_byte(50, 5, 100));
-        assert!(!should_read_one_byte(101, 5, 100));
+    fn should_read_file_contents_min_and_max() {
+        assert!(!should_read_file_contents(4, 5, 100));
+        assert!(should_read_file_contents(50, 5, 100));
+        assert!(!should_read_file_contents(101, 5, 100));
     }
 
     #[test]
@@ -756,7 +821,7 @@ mod tests {
         };
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        let status = warm_tree(root, &cfg, &shutdown);
+        let status = warm_tree(root, &cfg, &shutdown, "", None);
         assert_eq!(status.files, 2);
         assert_eq!(status.byte_reads, 1);
         assert_eq!(status.metadata_only, 1);
