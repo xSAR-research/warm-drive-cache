@@ -2,16 +2,21 @@
   "version": 1,
   "paths": [
     {
-      "sync": "rclone://example-remote/example/path1",
-      "cache": "/path/to/rclone/cache"
+      "sync": "/home/user/mounts/project-a",
+      "cache": "/home/user/.rclone_cache",
+      "service": "rclone-gdrive-project-a.service"
     },
     {
-      "sync": "rclone://example-remote/example/path2",
-      "cache": "/path/to/rclone/cache"
+      "sync": "/home/user/mounts/project-b",
+      "cache": "/home/user/.rclone_cache",
+      "service": "rclone-gdrive-project-b.service"
     }
   ],
   "walk": {
-    "max_depth": null
+    "max_depth": null,
+    "min_file_size_bytes": 0,
+    "max_file_size_bytes": 0,
+    "max_threads": 8
   },
   "ignore": {
     "names": [".git", ".svn", "node_modules", ".cache", "target", "__pycache__"]

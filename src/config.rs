@@ -1,22 +1,9 @@
-// src/config.rs
-//
-// Minimal, isolated config loader for warm-drive-cache.
-// Replaces the hardcoded paths array + adds walk controls (max_depth) and ignore list.
-//
-// Loading priority (per approved plan):
-//   1. $WARM_DRIVE_CACHE_CONFIG (full path to a json file) - for CI, testing, multiple setups
-//   2. XDG: $XDG_CONFIG_HOME/warm-drive-cache/config.json  or  ~/.config/warm-drive-cache/config.json
-//
-// Rules:
-// - Missing file → return defaults that exactly match the old hardcoded constants (smooth transition)
-// - Bad JSON / unreadable / validation failure → Err with actionable message (caller does eprintln + exit 1)
-// - Paths must be non-empty and absolute (reject relatives for predictability + safety)
-// - Users are strongly encouraged (and now enforced) to use absolute paths
-//
-// This module is pure data + fs read. No side effects on the cache maintenance logic itself.
-// The 12 existing unit tests continue to pass because they never call main() or this loader for real paths.
-//
-// See README for example + location documentation.
+//! JSON configuration loader and validation for warm-drive-cache.
+//!
+//! Load order: run-dir `config.json` → `WARM_DRIVE_CACHE_CONFIG` → XDG config path.
+//! Public sample is tracked as `config.example.json`; local `config.json` is gitignored.
+//!
+//! See README for schema and examples. More xSAR tools: https://xSAR.com.au
 
 use serde::Deserialize;
 use std::env;
@@ -28,7 +15,7 @@ pub struct Config {
     #[serde(default = "default_version")]
     pub version: u32,
 
-    /// List of path pairs. "sync" is the rclone-exposed directory (traversed and 1 byte read per file to warm).
+    /// List of path pairs. "sync" is the rclone-exposed directory (traversed; size-gated 1-byte warm or metadata only).
     /// "cache" is the rclone --cache-dir (used ONLY for size calculation and deletion to clear stale cache data).
     /// The cache dir is typically separate from the sync dir to avoid deleting live data.
     pub paths: Vec<PathPair>,
@@ -45,24 +32,65 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PathPair {
-    /// The directory exposed by rclone mount (e.g. /home/user/Documents/Gdrive/AccessIT).
-    /// ONLY traversed for warming (read 1 byte from each file). NEVER delete from here.
+    /// The directory exposed by rclone mount (e.g. /home/user/mounts/project-a).
+    /// ONLY traversed for warming (1-byte read when size is in range, else attributes only). NEVER delete from here.
     pub sync: String,
     /// The rclone cache directory (from --cache-dir in service unit, e.g. /home/user/.rclone_cache).
     /// Used for on-disk size checks and complete deletion of contents to refresh cache.
     /// Can be shared across multiple sync dirs.
     pub cache: String,
+    /// Optional systemd **user** unit that mounts this sync path (e.g. `rclone-gdrive-project-a.service`).
+    /// When set, startup checks `systemctl --user is-active` and may offer to start an inactive unit.
+    #[serde(default)]
+    pub service: Option<String>,
 }
 
 fn default_version() -> u32 {
     1
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct WalkOptions {
     /// None (or omitted) = unlimited (exact behaviour before this feature).
     /// Some(n) = WalkDir::max_depth(n)
     pub max_depth: Option<usize>,
+
+    /// Minimum file size (bytes) eligible for a 1-byte warm read.
+    /// `0` means no minimum (any size is eligible on the low side).
+    #[serde(default = "default_min_file_size_bytes")]
+    pub min_file_size_bytes: u64,
+
+    /// Maximum file size (bytes) eligible for a 1-byte warm read.
+    /// `0` means no maximum (any size is eligible on the high side).
+    /// Files outside the min/max window only have attributes/metadata touched.
+    #[serde(default = "default_max_file_size_bytes")]
+    pub max_file_size_bytes: u64,
+
+    /// Maximum worker threads for concurrent file warm operations (open/read or metadata).
+    /// Default 8. Must be in 1..=64. Spinner shows active/max during the walk.
+    #[serde(default = "default_max_threads")]
+    pub max_threads: usize,
+}
+
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            max_depth: None,
+            min_file_size_bytes: default_min_file_size_bytes(),
+            max_file_size_bytes: default_max_file_size_bytes(),
+            max_threads: default_max_threads(),
+        }
+    }
+}
+
+fn default_min_file_size_bytes() -> u64 {
+    0
+}
+fn default_max_file_size_bytes() -> u64 {
+    0
+}
+fn default_max_threads() -> usize {
+    8
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -113,19 +141,19 @@ fn default_max_wait_secs() -> u64 {
 /// Falls back to WARM_DRIVE_CACHE_CONFIG env var, then XDG ProjectDirs.
 pub fn load() -> Result<Config, String> {
     // Check run directory (next to the binary) for config.json
-    if let Ok(exe) = env::current_exe() {
-        if let Some(run_dir) = exe.parent() {
-            let local = run_dir.join("config.json");
-            if local.exists() {
-                return load_from_path(&local);
-            }
+    if let Ok(exe) = env::current_exe()
+        && let Some(run_dir) = exe.parent()
+    {
+        let local = run_dir.join("config.json");
+        if local.exists() {
+            return load_from_path(&local);
         }
     }
 
-    if let Ok(p) = env::var("WARM_DRIVE_CACHE_CONFIG") {
-        if !p.is_empty() {
-            return load_from_path(&PathBuf::from(p));
-        }
+    if let Ok(p) = env::var("WARM_DRIVE_CACHE_CONFIG")
+        && !p.is_empty()
+    {
+        return load_from_path(&PathBuf::from(p));
     }
 
     // XDG / standard Linux location using the directories crate (correct, audited)
@@ -190,7 +218,10 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config, String> {
             }
             // Basic sanity (no control chars / NUL that could confuse paths later)
             if p.contains('\0') || p.chars().any(|c| c.is_control() && c != '\t') {
-                return Err(format!("{} path {:?} contains invalid control characters", label, p));
+                return Err(format!(
+                    "{} path {:?} contains invalid control characters",
+                    label, p
+                ));
             }
         }
         // Safety: cache must not be under or same as sync (to prevent deleting live data)
@@ -201,19 +232,46 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config, String> {
                 pair.cache, pair.sync
             ));
         }
+        if let Some(svc) = &pair.service {
+            let name = svc.trim();
+            if name.is_empty() {
+                return Err("paths[].service is empty; omit the field or set a unit name".into());
+            }
+            // Unit names: letters, digits, @_.- and must end with .service for mounts we manage
+            if name.contains('/') || name.contains('\0') || name.chars().any(|c| c.is_control()) {
+                return Err(format!(
+                    "service name {:?} looks invalid (no path separators or control characters)",
+                    svc
+                ));
+            }
+        }
     }
 
     // Reasonable bounds (defence in depth)
     if cfg.paths.len() > 128 {
         return Err("too many paths in config (max 128)".to_string());
     }
-    if let Some(d) = cfg.walk.max_depth {
-        if d == 0 {
-            return Err(
-                "walk.max_depth 0 is not useful (would only visit the roots themselves)"
-                    .to_string(),
-            );
-        }
+    if let Some(d) = cfg.walk.max_depth
+        && d == 0
+    {
+        return Err(
+            "walk.max_depth 0 is not useful (would only visit the roots themselves)".to_string(),
+        );
+    }
+
+    if cfg.walk.max_threads == 0 || cfg.walk.max_threads > 64 {
+        return Err(format!(
+            "walk.max_threads must be between 1 and 64 (got {})",
+            cfg.walk.max_threads
+        ));
+    }
+
+    let min = cfg.walk.min_file_size_bytes;
+    let max = cfg.walk.max_file_size_bytes;
+    if min != 0 && max != 0 && min > max {
+        return Err(format!(
+            "walk.min_file_size_bytes ({min}) cannot be greater than walk.max_file_size_bytes ({max})"
+        ));
     }
 
     Ok(cfg)
@@ -233,7 +291,11 @@ mod tests {
         assert_eq!(c.paths.len(), 1);
         assert_eq!(c.paths[0].sync, "/tmp/foo");
         assert_eq!(c.paths[0].cache, "/tmp/cache");
+        assert!(c.paths[0].service.is_none());
         assert!(c.walk.max_depth.is_none());
+        assert_eq!(c.walk.min_file_size_bytes, 0);
+        assert_eq!(c.walk.max_file_size_bytes, 0);
+        assert_eq!(c.walk.max_threads, 8);
         assert!(c.ignore.names.is_empty());
         // mount_wait should have today's defaults via our Default impls
         assert_eq!(c.mount_wait.initial_secs, 3);
@@ -241,10 +303,15 @@ mod tests {
         let full = r#"{
             "version": 1,
             "paths": [
-                {"sync": "/a", "cache": "/cache/a"},
+                {"sync": "/a", "cache": "/cache/a", "service": "rclone-a.service"},
                 {"sync": "/b", "cache": "/cache/b"}
             ],
-            "walk": { "max_depth": 5 },
+            "walk": {
+                "max_depth": 5,
+                "min_file_size_bytes": 0,
+                "max_file_size_bytes": 5120,
+                "max_threads": 4
+            },
             "ignore": { "names": [".git", "target"] },
             "mount_wait": { "initial_secs": 1, "retry_delays_secs": [9], "max_wait_secs": 99 }
         }"#;
@@ -252,7 +319,12 @@ mod tests {
         assert_eq!(c.paths.len(), 2);
         assert_eq!(c.paths[0].sync, "/a");
         assert_eq!(c.paths[0].cache, "/cache/a");
+        assert_eq!(c.paths[0].service.as_deref(), Some("rclone-a.service"));
+        assert!(c.paths[1].service.is_none());
         assert_eq!(c.walk.max_depth, Some(5));
+        assert_eq!(c.walk.min_file_size_bytes, 0);
+        assert_eq!(c.walk.max_file_size_bytes, 5120);
+        assert_eq!(c.walk.max_threads, 4);
         assert_eq!(
             c.ignore.names,
             vec![".git".to_string(), "target".to_string()]
@@ -280,7 +352,8 @@ mod tests {
         // Relative path must be rejected
         {
             let mut f = File::create(&p).unwrap();
-            f.write_all(br#"{"paths":[{"sync":"relative/path","cache":"/cache/foo"}]}"#).unwrap();
+            f.write_all(br#"{"paths":[{"sync":"relative/path","cache":"/cache/foo"}]}"#)
+                .unwrap();
         }
         let err = load_from_path(&p).unwrap_err();
         assert!(
@@ -306,5 +379,63 @@ mod tests {
         assert!(c.paths.is_empty());
         assert_eq!(c.mount_wait.initial_secs, 3);
         assert!(c.walk.max_depth.is_none());
+        assert_eq!(c.walk.min_file_size_bytes, 0);
+        assert_eq!(c.walk.max_file_size_bytes, 0);
+        assert_eq!(c.walk.max_threads, 8);
+    }
+
+    #[test]
+    fn config_rejects_min_greater_than_max_file_size() {
+        let td = TempDir::new().expect("tempdir");
+        let p = td.path().join("config.json");
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],
+                 "walk":{"min_file_size_bytes":100,"max_file_size_bytes":50}}"#,
+            )
+            .unwrap();
+        }
+        let err = load_from_path(&p).unwrap_err();
+        assert!(
+            err.contains("min_file_size_bytes") && err.contains("max_file_size_bytes"),
+            "expected size range error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn config_rejects_invalid_max_threads() {
+        let td = TempDir::new().expect("tempdir");
+        let p = td.path().join("config.json");
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],
+                 "walk":{"max_threads":0}}"#,
+            )
+            .unwrap();
+        }
+        let err = load_from_path(&p).unwrap_err();
+        assert!(
+            err.contains("max_threads"),
+            "expected max_threads error: {}",
+            err
+        );
+
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],
+                 "walk":{"max_threads":100}}"#,
+            )
+            .unwrap();
+        }
+        let err = load_from_path(&p).unwrap_err();
+        assert!(
+            err.contains("max_threads"),
+            "expected max_threads error: {}",
+            err
+        );
     }
 }

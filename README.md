@@ -1,62 +1,89 @@
 # warm-drive-cache
 
-> External configuration via `config.json` (supports paths, `max_depth`, and ignore names such as `.git`).
+> External configuration via `config.json` (paths, walk depth/size gates/threads, ignore names).
 > See the "Configuration via `config.json`" section below.
 
 Rust utility for maintenance of rclone FUSE mount cache directories. Part of the [xSAR](https://xSAR.com.au) toolkit.
 
 **Critical distinction (safety):**
-- "sync" (exposed) directories: the paths rclone mounts (e.g. /home/user/mounts/myproject). The tool ONLY traverses these and reads 1 byte from each file to warm/update metadata in the cache. **NEVER delete from sync directories** — they contain your live data.
+- "sync" (exposed) directories: the paths rclone mounts (e.g. /home/user/mounts/myproject). The tool ONLY traverses these and warms the VFS: **1-byte read** when file size is inside the configured min/max window, otherwise **attributes/metadata only**. **NEVER delete from sync directories** — they contain your live data.
 - "cache" directory: the separate directory given to rclone via `--cache-dir` (e.g. ~/.rclone_cache). The tool calculates on-disk size (before/after) and performs complete deletion of contents here only, to clear stale cached data.
 
 The cache dir is often shared across multiple sync dirs. See your rclone systemd units for the exact `--cache-dir` value.
 
 ## Configuration
 The tool loads a config.json file containing an array of path pairs. Each pair has:
-- `sync`: the rclone-exposed directory to traverse and warm (read 1 byte/file).
+- `sync`: the rclone-exposed directory to traverse and warm (size-gated 1-byte read or metadata only; concurrent workers).
 - `cache`: the rclone cache directory for size checks and deletion.
 
+Resolved walk settings (`min_file_size_bytes`, `max_file_size_bytes`, `max_threads`, etc.) are printed once at program start after the JSON config is loaded.
+
 ## Reporting
-The application calculates and reports the on-disk size (in bytes, shown as MiB when large) of the **cache** directory immediately before and after the refresh operation. It also reports oldest/newest file dates for the cache.
+The application calculates and reports the on-disk size (in bytes, shown as MiB when large) of the **cache** directory immediately before and after the refresh operation. The live status block shows a summary line (`dirs` / `files` / `thr active/max` / errors) plus **one line per worker** (`N of M`, compact size, `READ` or `ATTR`, path shortened by stripping the sync root / `$HOME` then truncated to 80 characters). Graceful stop: **Ctrl+C** or **q** (TTY) finishes in-flight workers and does not start new files.
 
 ## Cache Maintenance
-The tool performs a complete deletion of all files and subdirectories **in the cache directory only** (never the sync/exposed dirs) to prevent stale data accumulation. Use --dry-run to preview; user approval is required for actual deletion.
+The tool performs a complete deletion of all files and subdirectories **in the cache directory only** (never the sync/exposed dirs) to prevent stale data accumulation. Deletion is **non-interactive** (no confirmation prompt). Use `--dry-run` to preview what would be deleted.
 
 ## Documentation & Secrets Policy
 An example config.json is provided. The README.md, all source comments, and the example file contain no concrete local paths, usernames, or sensitive values. All references use generic placeholders (e.g. rclone://example-remote/example/path or /path/to/cache). Paths are classified as secrets.
+
+## CLI options
+
+| Option | Description |
+|--------|-------------|
+| `-h`, `--help` | Brief usage, where `config.json` must live, embedded `config.example.json`, link to README |
+| `-v`, `--version` | `Codebase Version`, `Codebase release` date, AGPL-3.0-only, repo + https://xSAR.com.au |
+| `-c`, `--check` | Validate config layout; for each entry print **service name**, **sync directory**, **`--cache-dir` from the systemd unit** (preferred), and **current cache size** |
+| `--dry-run` | Simulate cache deletion only (no warm) |
+
+Startup always prints the same version/release identity block (product of xSAR, licence, website, source).
 
 ## Program Flow
 
 ```mermaid
 flowchart TD
-    Start[Start] --> Banner["Print startup banner"]
-    Banner --> LoadConfig["Load config\nconfig.json in run dir (next to binary)\nor WARM_DRIVE_CACHE_CONFIG env\nor XDG ~/.config/.../config.json"]
+    Start[Start] --> Cli{"CLI flags?"}
+    Cli -->|-h / --help| Help["Print help +\nexample config.json"]
+    Cli -->|-v / --version| Ver["Codebase Version +\nCodebase release +\nAGPL + repo + website"]
+    Cli -->|-c / --check| CheckBanner["Startup banner"]
+    CheckBanner --> CheckLoad["Load + validate config.json"]
+    CheckLoad --> CheckReport["Per entry:\nservice name\nsync directory\n--cache-dir from unit\ncache size"]
+    CheckReport --> CleanupCheck["cleanup summary"]
+    Cli -->|normal / --dry-run| Banner["Startup banner\nCodebase Version/release\nAGPL + xSAR + website"]
+    Banner --> LoadConfig["Load config\nrun-dir config.json or\nWARM_DRIVE_CACHE_CONFIG or XDG"]
     LoadConfig --> Validate{"Valid config?\npaths non-empty?"}
     Validate -->|No| Error["Print clear error\nexit 1"]
-    Validate -->|Yes| PrepIgnore["Build ignore_names HashSet\nfrom config.ignore.names"]
-    PrepIgnore --> ForEach["For each root path in config.paths"]
-    ForEach --> Exists{"try_exists?"}
-    Exists -->|No| Skip["errors++\ncontinue"]
-    Exists -->|Yes| Wait["wait_for_mount_content\nusing config.mount_wait\nsleep_capped + retries"]
-    Wait --> Status["Init WalkStatus counters"]
-    Status --> Walker["Build WalkDir\nfollow_links=false\nmax_depth if set\nfilter_entry: !should_skip_entry\n(depth > 0 and basename in ignore)"]
-    Walker --> EntryLoop["For each entry"]
-    EntryLoop --> Touch["symlink_metadata\ntouch to warm VFS"]
-    Touch --> IsDir{"entry.is_dir?"}
-    IsDir -->|Yes| Dir["record_dir\nread_dir to cache listing"]
-    IsDir -->|No| File["record_file"]
-    Dir & File --> Render["render live progress\nspinner + truncate + counts"]
-    Render --> EntryLoop
-    EntryLoop -->|walk complete| PerPath["Sync totals\nfinal render\nprint per-path summary"]
-    PerPath --> ForEach
-    ForEach -->|all paths done| Grand["Print grand totals\ndirs/files/errors"]
-    Grand --> End[End]
-    
+    Validate -->|Yes| PrintCfg["Print resolved settings\npaths + walk + services"]
+    PrintCfg --> ForEach["For each path pair"]
+    ForEach --> StopCheck{"Shutdown\nrequested?"}
+    StopCheck -->|Yes| EndStop["Skip remaining pairs"]
+    StopCheck -->|No| Preflight["cache_check pre-flight\nsystemd active?\nprompt start if needed\nsync read + cache probe"]
+    Preflight -->|skip| Notice["Notice: service/path not usable\nwarmer skipped"]
+    Notice --> ForEach
+    Preflight -->|ok| SizeBefore["Report cache size before"]
+    SizeBefore --> Dry{"--dry-run?"}
+    Dry -->|Yes| SimDelete["Simulate delete only"]
+    SimDelete --> ForEach
+    Dry -->|No| QuitHandlers["Install SIGINT / q\nraw TTY quit"]
+    QuitHandlers --> DeleteCache["Delete cache contents\nnon-interactive"]
+    DeleteCache --> WarmTree["warm_tree: WalkDir sync\nmax_depth + ignore.names"]
+    WarmTree --> Workers["Worker pool max_threads\nREAD 1-byte if in size range\nelse ATTR metadata only"]
+    Workers --> Status["Live status block\nN of M · size · READ/ATTR · path"]
+    Status --> Drain["Drain in-flight on cancel"]
+    Drain --> Summary["Per-path summary"]
+    Summary --> ForEach
+    ForEach -->|done| Cleanup["cleanup: thanks +\nGitHub issues link"]
+    EndStop --> Cleanup
+    Cleanup --> End[End]
+    Help --> End
+    Ver --> End
+    CleanupCheck --> End
+
     classDef error fill:#f99,stroke:#333
-    class Error,Skip error
+    class Error,Notice error
 ```
 
-The diagram shows the high-level flow from startup through config-driven path processing, mount settling, controlled walking (with max_depth and ignore.names — note root protection + subtree pruning via should_skip_entry), metadata touching for VFS warming, and live + final reporting. The ignore HashSet is prepared once before processing paths.
+Flow: optional CLI exit (`help` / `version` / `check`) → otherwise banner with **Codebase Version** and **Codebase release** → load config → per pair **pre-flight** (systemd + permissions) → wipe **cache** → parallel warm of **sync**. Ctrl+C/`q` finishes in-flight work only.
 
 ## Configuration via `config.json`
 
@@ -64,54 +91,98 @@ The tool is configured **exclusively** via a JSON file. There are no hardcoded p
 
 ### Location (in priority order)
 
-1. `config.json` in the run directory (the directory containing the executable binary). This allows bundling the config next to the binary in release directories.
-2. `WARM_DRIVE_CACHE_CONFIG` environment variable (must point to a full path to a `.json` file). Useful for testing, CI, or running with different configurations.
-3. `$XDG_CONFIG_HOME/warm-drive-cache/config.json`  
-   Falls back to `~/.config/warm-drive-cache/config.json` on typical Linux setups (including Arch).
+1. **`config.json` next to the executable** (same directory as the binary). Preferred for desktop/systemd wrappers. **This file is gitignored** when it holds real paths.
+2. `WARM_DRIVE_CACHE_CONFIG` environment variable → full path to a `.json` file (CI / alternate profiles).
+3. XDG: `$XDG_CONFIG_HOME/warm-drive-cache/config.json` or `~/.config/warm-drive-cache/config.json`.
 
-### Missing config file behaviour
+**Tracked vs local**
 
-If no config file exists at the chosen location:
-- The loader returns a default `Config` (with the classic timing values below).
-- `paths` will be empty.
-- `main()` will then print a clear error and exit, instructing you to create the file.
+| File | Git | Purpose |
+|------|-----|---------|
+| `config.example.json` | tracked | Public template with **placeholders only** (no real users/paths) |
+| `config.json` | **untracked** | Your live machine paths + real systemd unit names |
+| `live.json` | **untracked** | Optional local alternate profile |
 
-This is intentional — the tool is useless without at least one path.
+Copy: `cp config.example.json config.json` (or next to `target/release/` after build) and edit.
 
-### Full Schema
+### Missing config behaviour
 
-All top-level fields except `paths` are optional and have sensible defaults that match the original hardcoded behaviour.
+If no file is found, the loader returns empty `paths` and the program exits with instructions to create the file. The tool is useless without at least one path pair.
 
-| Field                        | Type                    | Required | Default          | Description |
-|-----------------------------|-------------------------|----------|------------------|-------------|
-| `version`                   | integer                 | no       | `1`              | Config schema version. Reserved for future breaking changes. |
-| `paths`                     | array of objects        | **yes**  | —                | Array of pairs. Each: `{"sync": "/path/to/exposed/rclone/dir", "cache": "/path/to/rclone/cache"}`. "sync" dirs are only traversed/warmed; "cache" is for size/delete. Cache can be shared. |
-| `walk.max_depth`            | integer or `null`       | no       | `null` (unlimited) | Maximum directory depth for `WalkDir`. `null` or omitted = no limit. |
-| `ignore.names`              | array of string         | no       | `[]`             | Basenames (files or directories) to skip during the walk. Matching directories cause their entire subtree to be pruned. Matching is exact on the basename (case-sensitive) and applies at any depth. The root of any configured path is **never** ignored. |
-| `mount_wait.initial_secs`   | integer                 | no       | `3`              | Seconds to wait after confirming the path exists before checking for content. |
-| `mount_wait.retry_delays_secs` | array of integer     | no       | `[3, 5, 8]`      | List of retry delays (in seconds) used while the directory still appears empty. |
-| `mount_wait.max_wait_secs`  | integer                 | no       | `30`             | Hard ceiling on total waiting time per path. |
+### Layout overview
 
-### Minimal working example
-```json
+```text
 {
-  "paths": [
-    {"sync": "rclone://example-remote/example/path1", "cache": "/path/to/rclone/cache"},
-    {"sync": "rclone://example-remote/example/path2", "cache": "/path/to/rclone/cache"}
-  ]
+  "version": 1,                 // optional schema version
+  "paths": [ ... ],             // required: one object per mount/cache pair
+  "walk": { ... },              // optional walk / warm controls
+  "ignore": { "names": [...] }, // optional basename skip list
+  "mount_wait": { ... }         // optional FUSE settle timings
 }
 ```
 
-### Full example
+### `paths[]` entries (required array)
+
+Each element describes **one** mount to warm and the cache directory that may be cleared.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `sync` | string | **yes** | Absolute path to the **rclone mount** (live data). Traversed and warmed only — **never deleted**. |
+| `cache` | string | **yes** | Absolute path to the rclone **`--cache-dir`** used by that mount (or a shared cache). Used for size reports and non-interactive content deletion. |
+| `service` | string | no | systemd **user** unit name, e.g. `rclone-gdrive-project-a.service`. Used by pre-flight and by `-c`/`--check` to read `--cache-dir` from the unit and report active/inactive. |
+
+**Safety rules encoded in the loader**
+
+- `sync` and `cache` must be **absolute** (start with `/`).
+- `sync` and `cache` must **not** nest or equal each other (prevents deleting live data).
+- `service`, if present, must not contain `/` or control characters.
+- At least one path pair is required.
+
+### `walk` (optional)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_depth` | integer or `null` | `null` | `WalkDir` max depth; `null` = unlimited. `0` is rejected. |
+| `min_file_size_bytes` | integer | `0` | Min size for a 1-byte warm read; `0` = no lower bound. |
+| `max_file_size_bytes` | integer | `0` | Max size for a 1-byte warm read; `0` = no upper bound. Outside range → **ATTR** (metadata only). |
+| `max_threads` | integer | `8` | Concurrent warm workers (`1`–`64`). |
+
+### `ignore` (optional)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `names` | string[] | `[]` | Exact basenames to prune (e.g. `.git`, `node_modules`). Matching directories skip their whole subtree. Config roots are never ignored. |
+
+### `mount_wait` (optional)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `initial_secs` | integer | `3` | Wait after path exists before content probe. |
+| `retry_delays_secs` | integer[] | `[3, 5, 8]` | Delays while the mount listing looks empty. |
+| `max_wait_secs` | integer | `30` | Hard ceiling per path. |
+
+### Full example (placeholders only)
+
 ```json
 {
   "version": 1,
   "paths": [
-    {"sync": "/home/user/mounts/project-a", "cache": "/home/user/.rclone_cache"},
-    {"sync": "/home/user/mounts/project-b", "cache": "/home/user/.rclone_cache"}
+    {
+      "sync": "/home/user/mounts/project-a",
+      "cache": "/home/user/.rclone_cache",
+      "service": "rclone-gdrive-project-a.service"
+    },
+    {
+      "sync": "/home/user/mounts/project-b",
+      "cache": "/home/user/.rclone_cache",
+      "service": "rclone-gdrive-project-b.service"
+    }
   ],
   "walk": {
-    "max_depth": 5
+    "max_depth": null,
+    "min_file_size_bytes": 0,
+    "max_file_size_bytes": 0,
+    "max_threads": 8
   },
   "ignore": {
     "names": [".git", ".svn", "node_modules", "target", "__pycache__"]
@@ -124,13 +195,22 @@ All top-level fields except `paths` are optional and have sensible defaults that
 }
 ```
 
-### Important rules & validation
+### `-c` / `--check` report fields
 
-- Each entry must have both `sync` and `cache` as **absolute** paths (start with `/`). Relative paths are rejected.
-- `paths` must not be empty.
-- `sync` dirs are **never** deleted from (they are your live rclone-exposed data). Only traversed + 1 byte read per file.
-- `cache` dirs receive the size calculations and full content deletion.
-- `walk.max_depth` of `0` is rejected (it would only visit the root itself).
+For each `paths[]` entry the check mode prints a spaced group:
+
+1. **Service name** — `paths[].service` (or note if omitted)
+2. **File directory** — `paths[].sync` (mount target) + exists/dir status
+3. **Cache path** — prefers **`--cache-dir` parsed from the user unit** (`systemctl --user cat`); falls back to `paths[].cache` with a note if the flag is missing or differs
+4. **Current cache size** — recursive on-disk size of the effective cache directory
+5. **systemd** — active / inactive when a unit name is set
+
+### Important rules (summary)
+
+- Prefer absolute paths only; relative paths are rejected.
+- Never delete under `sync`; only warm.
+- Delete only under `cache` (non-interactive; use `--dry-run` to preview).
+- Keep `config.example.json` free of real usernames and host paths when publishing.
 - Omitted sections or fields fall back to the values shown in the table above.
 - When the file is completely missing, the program still uses the defaults for `walk`, `ignore`, and `mount_wait`, but `paths` becomes empty and triggers a helpful startup error.
 
@@ -185,8 +265,16 @@ Unit tests cover the pure helpers and core logic using synthetic `tempfile` tree
 ## Example output
 
 ```
-🚀 warm-drive-cache: Rust utility for removing cache staleness and warming.
-   Licenced under MIT by xSAR. For more tools visit https://xSAR.com.au or our repo at https://github.com/xSAR-research/warm-drive-cache
+┌────────────────────────────────────────────────────────────┐
+│  warm-drive-cache v0.1.0
+│  A product of xSAR
+│  Website: https://xSAR.com.au
+│  Licence: AGPL-3.0-only  (full text: LICENSE in the source tree)
+│  Homepage: https://xSAR.com.au
+│  Source:  https://github.com/xSAR-research/warm-drive-cache
+└────────────────────────────────────────────────────────────┘
+   Rust utility for removing rclone cache staleness and warming mounts.
+   Quit gracefully: Ctrl+C (SIGINT) or press q (TTY) — finishes in-flight workers, starts no new work.
 
 📂 Sync dir (traverse/warm only): rclone://example-remote/example/path1
    Cache dir (size/delete only): /path/to/rclone/cache
@@ -278,4 +366,4 @@ For more tools, guides, and projects, visit [xSAR](https://xSAR.com.au).
 
 ## Licence
 
-This project is licensed under the [MIT License](LICENSE). See the `LICENSE` file for full details.
+This project is licensed under the [GNU Affero General Public License v3.0 only](LICENSE) (AGPL-3.0-only). See the `LICENSE` file for the full text.
