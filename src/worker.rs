@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 const STATUS_REFRESH: Duration = Duration::from_millis(80);
-const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Dense 8-dot Braille spinner (common CLI “finer” progress glyphs).
+const SPINNER_FRAMES: &[char] = &['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
 
 /// Maximum characters for the path shown on each worker status line (includes directories).
 pub const DISPLAY_PATH_MAX_CHARS: usize = 80;
@@ -116,33 +117,33 @@ pub fn shorten_path_for_display(path: &Path, strip_roots: &[&Path]) -> String {
     truncate_display(&s, DISPLAY_PATH_MAX_CHARS)
 }
 
-/// Format one numbered worker line for the live status block.
-/// Example: `   1 of 8   1.2KiB  READ  subdir/file.txt`
-fn format_thread_slot_line(
-    index_1based: usize,
-    max_threads: usize,
-    slot: &ThreadSlotView,
-) -> String {
-    let thr = format!("{index_1based} of {max_threads}");
+/// Column header for the live per-thread table.
+const THREAD_TABLE_HEADER: &str = "Count  Size      Action  Source filename";
+const THREAD_TABLE_RULE: &str =
+    "------------------------------------------------------------------------------------------------------";
+
+/// Format one numbered worker line for the live status table.
+/// Example: `1        8.1KiB  READ    subdir/file.txt`
+fn format_thread_slot_line(index_1based: usize, slot: &ThreadSlotView) -> String {
     match slot.mode {
         ThreadWorkMode::Idle => {
-            format!("   {thr:<8}  —         idle")
+            format!("{index_1based:<5}  {:>8}  {:<6}  —", "—", "idle")
         }
         ThreadWorkMode::ByteRead => {
             let name = truncate_display(&slot.path, DISPLAY_PATH_MAX_CHARS);
             let sz = format_bytes_compact(slot.size);
-            format!("   {thr:<8}  {sz:>8}  READ  {name}")
+            format!("{index_1based:<5}  {sz:>8}  {:<6}  {name}", "READ")
         }
         ThreadWorkMode::AttrOnly => {
             let name = truncate_display(&slot.path, DISPLAY_PATH_MAX_CHARS);
             let sz = format_bytes_compact(slot.size);
             // Outside size window: attributes-only (no File contents read).
-            format!("   {thr:<8}  {sz:>8}  ATTR  {name}")
+            format!("{index_1based:<5}  {sz:>8}  {:<6}  {name}", "ATTRIB")
         }
     }
 }
 
-/// Multi-line live progress: header + one numbered line per worker thread.
+/// Multi-line live progress: summary header + per-worker table.
 pub struct WalkStatus {
     started: Instant,
     last_render: Instant,
@@ -158,6 +159,8 @@ pub struct WalkStatus {
     pub metadata_only: usize,
     /// True when SIGINT / 'q' requested stop (in-flight work still finishes).
     pub cancelled: bool,
+    /// Sync mount root shown as “Local target” (home-shortened when possible).
+    local_target: String,
     /// Shared with workers: current file / mode per thread index.
     slots: Arc<Mutex<Vec<ThreadSlotView>>>,
     /// How many lines the last render wrote (for ANSI cursor-up redraw).
@@ -165,7 +168,13 @@ pub struct WalkStatus {
 }
 
 impl WalkStatus {
-    pub fn new(dirs: usize, files: usize, errors: usize, max_threads: usize) -> Self {
+    pub fn new(
+        dirs: usize,
+        files: usize,
+        errors: usize,
+        max_threads: usize,
+        local_target: impl Into<String>,
+    ) -> Self {
         let slots = Arc::new(Mutex::new(
             (0..max_threads).map(|_| ThreadSlotView::idle()).collect(),
         ));
@@ -181,6 +190,7 @@ impl WalkStatus {
             byte_reads: 0,
             metadata_only: 0,
             cancelled: false,
+            local_target: local_target.into(),
             slots,
             rendered_lines: 0,
         }
@@ -209,7 +219,7 @@ impl WalkStatus {
         self.metadata_only = metadata_only.load(Ordering::Relaxed);
     }
 
-    pub fn render(&mut self, current: &Path, force: bool) {
+    pub fn render(&mut self, _current: &Path, force: bool) {
         if !force && self.last_render.elapsed() < STATUS_REFRESH {
             return;
         }
@@ -219,7 +229,7 @@ impl WalkStatus {
 
         let spinner = SPINNER_FRAMES[self.frame];
         let elapsed = self.started.elapsed().as_secs();
-        let location = truncate_display(&shorten_path_for_display(current, &[]), 40);
+        let target = truncate_display(&self.local_target, 48);
 
         let stop_note = if self.cancelled {
             "  STOPPING (finish in-flight, no new work)"
@@ -227,8 +237,17 @@ impl WalkStatus {
             ""
         };
 
-        let header = format!(
-            "   {spinner}  dirs {dirs:>6}  files {files:>6}  thr {active}/{max_thr}  errs {errs:>4}  {elapsed:>4}s  walk {location}{stop_note}",
+        // Fixed multi-line layout (must match finish_line clear count):
+        // 1 Running:
+        // 2 spinner summary
+        // 3 blank
+        // 4 Running threads:
+        // 5 blank
+        // 6 column header
+        // 7 rule
+        // 8.. thread rows
+        let summary = format!(
+            "{spinner}  Directories: {dirs:>6}  Files: {files:>6}  Threads: {active}/{max_thr}  Errors: {errs}  Elapsed time: {elapsed}s  Local target: {target}{stop_note}",
             dirs = self.dirs,
             files = self.files,
             active = self.active_threads,
@@ -241,10 +260,10 @@ impl WalkStatus {
             Ok(slots) => slots
                 .iter()
                 .enumerate()
-                .map(|(i, s)| format_thread_slot_line(i + 1, max_thr, s))
+                .map(|(i, s)| format_thread_slot_line(i + 1, s))
                 .collect(),
-            Err(_) => (0..self.max_threads)
-                .map(|i| format!("   {} of {}  —         idle", i + 1, max_thr))
+            Err(_) => (0..max_thr)
+                .map(|i| format_thread_slot_line(i + 1, &ThreadSlotView::idle()))
                 .collect(),
         };
 
@@ -253,20 +272,40 @@ impl WalkStatus {
             print!("\x1b[{}A", self.rendered_lines);
         }
 
-        // Wider pad: thread label + size + mode + up to DISPLAY_PATH_MAX_CHARS path.
-        print!("\x1b[2K\r{header}\n");
-        for line in &slot_lines {
-            print!("\x1b[2K\r{:<160}\n", line);
+        const LINE_PAD: usize = 200;
+        let mut lines: Vec<String> = Vec::with_capacity(7 + slot_lines.len());
+        lines.push("Running:".into());
+        lines.push(summary);
+        lines.push(String::new());
+        lines.push("Running threads:".into());
+        lines.push(String::new());
+        lines.push(THREAD_TABLE_HEADER.into());
+        lines.push(THREAD_TABLE_RULE.into());
+        lines.extend(slot_lines);
+
+        for line in &lines {
+            print!("\x1b[2K\r{:<LINE_PAD$}\n", line);
         }
 
-        self.rendered_lines = 1 + slot_lines.len();
+        self.rendered_lines = lines.len();
         let _ = io::stdout().flush();
     }
 
-    /// Leave the status block on screen and put the cursor below it.
+    /// Erase the live multi-line status block (header + per-worker lines) so
+    /// completed services do not leave idle-thread clutter on the terminal.
+    /// Subsequent summary lines print in its place.
     pub fn finish_line(&mut self) {
-        println!();
-        self.rendered_lines = 0;
+        if self.rendered_lines > 0 {
+            // Cursor to first line of the block, then clear each row.
+            print!("\x1b[{}A", self.rendered_lines);
+            for _ in 0..self.rendered_lines {
+                print!("\x1b[2K\r\n");
+            }
+            // Return to the top of the cleared region for the next println!.
+            print!("\x1b[{}A", self.rendered_lines);
+            let _ = io::stdout().flush();
+            self.rendered_lines = 0;
+        }
     }
 }
 
@@ -411,7 +450,8 @@ pub fn warm_tree(
     let metadata_only = Arc::new(AtomicUsize::new(0));
     let pending = Arc::new(AtomicUsize::new(0));
 
-    let mut status = WalkStatus::new(0, 0, 0, max_threads);
+    let local_target = shorten_path_for_display(sync_path, &[]);
+    let mut status = WalkStatus::new(0, 0, 0, max_threads, local_target);
     let slots = Arc::clone(&status.slots);
     let ignore_names: HashSet<&OsStr> = cfg.ignore.names.iter().map(OsStr::new).collect();
     let sync_root = sync_path.to_path_buf();
@@ -682,16 +722,17 @@ mod tests {
 
     #[test]
     fn walkstatus_new_initializes_counters() {
-        let mut s = WalkStatus::new(3, 7, 1, 8);
+        let mut s = WalkStatus::new(3, 7, 1, 8, "~/Documents/Gdrive/AccessIT");
         let p = Path::new(".");
         s.render(p, true);
         assert_eq!(s.max_threads, 8);
         assert_eq!(s.active_threads, 0);
+        assert!(s.local_target.contains("AccessIT") || s.local_target.contains("Gdrive"));
     }
 
     #[test]
     fn walkstatus_record_methods_increment_correctly() {
-        let mut s = WalkStatus::new(10, 20, 2, 4);
+        let mut s = WalkStatus::new(10, 20, 2, 4, "/tmp/mount");
         s.record_dir();
         s.record_error();
         s.render(Path::new("/tmp"), true);
@@ -699,7 +740,7 @@ mod tests {
 
     #[test]
     fn walkstatus_render_rate_and_frame_advances() {
-        let mut s = WalkStatus::new(0, 0, 0, 8);
+        let mut s = WalkStatus::new(0, 0, 0, 8, "~/mounts/project");
         let p = Path::new("some/long/path/for/display/truncation/test");
         s.render(p, true);
         s.render(p, false);
@@ -708,26 +749,28 @@ mod tests {
     #[test]
     fn format_thread_slot_line_modes() {
         let idle = ThreadSlotView::idle();
-        assert!(format_thread_slot_line(1, 8, &idle).contains("idle"));
-        assert!(format_thread_slot_line(1, 8, &idle).contains("1 of 8"));
+        let idle_line = format_thread_slot_line(1, &idle);
+        assert!(idle_line.contains("idle"));
+        assert!(idle_line.starts_with('1'));
 
         let read = ThreadSlotView {
             mode: ThreadWorkMode::ByteRead,
             size: 100,
             path: "subdir/small.txt".into(),
         };
-        let read_line = format_thread_slot_line(2, 8, &read);
-        assert!(read_line.contains("2 of 8"));
+        let read_line = format_thread_slot_line(2, &read);
+        assert!(read_line.starts_with('2'));
         assert!(read_line.contains("READ"));
+        assert!(read_line.contains("subdir/small.txt"));
 
         let attr = ThreadSlotView {
             mode: ThreadWorkMode::AttrOnly,
             size: 5 * 1024 * 1024,
             path: "big.bin".into(),
         };
-        let attr_line = format_thread_slot_line(3, 8, &attr);
-        assert!(attr_line.contains("3 of 8"));
-        assert!(attr_line.contains("ATTR"));
+        let attr_line = format_thread_slot_line(3, &attr);
+        assert!(attr_line.starts_with('3'));
+        assert!(attr_line.contains("ATTRIB"));
     }
 
     #[test]
