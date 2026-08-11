@@ -4,7 +4,7 @@ use std::path::Path;
 
 fn main() {
     // Rerun build if sample changes
-    println!("cargo:rerun-if-changed=config.example.json");
+    println!("cargo:rerun-if-changed=warm-drive-cache-example.json");
 
     // Determine target directory for the current profile (debug or release)
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".into());
@@ -21,8 +21,8 @@ fn main() {
         return;
     }
 
-    let src = Path::new("config.example.json");
-    let dest = dest_dir.join("config.example.json");
+    let src = Path::new("warm-drive-cache-example.json");
+    let dest = dest_dir.join("warm-drive-cache-example.json");
 
     match fs::copy(src, &dest) {
         Ok(_) => {

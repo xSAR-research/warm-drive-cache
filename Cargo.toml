@@ -9,8 +9,8 @@ repository = "https://github.com/xSAR-research/warm-drive-cache"
 
 [dependencies]
 walkdir = "2"
-# serde + serde_json: required for clean deserialization of config.json (paths, walk.max_depth, ignore.names, mount_wait).
-# directories: the correct tiny crate for XDG-compliant config location (~/.config/warm-drive-cache/config.json or $XDG_CONFIG_HOME).
+# serde + serde_json: required for clean deserialization of warm-drive-cache.json (paths, walk.max_depth, ignore.names, mount_wait).
+# directories: the correct tiny crate for XDG-compliant config location (~/.config/warm-drive-cache/warm-drive-cache.json or $XDG_CONFIG_HOME).
 # These are runtime deps (config drives the tool). Zero impact on the pure unit-tested helpers.
 # Justification: minimal, data-only, industry standard for this exact use-case. Matches the "Planned next" in README.
 # See approved plan + security subagent review for rationale + alternatives considered.
@@ -21,6 +21,7 @@ directories = "5"
 # libc: termios for single-key 'q' quit without requiring Enter (TTY only).
 ctrlc = "3"
 libc = "0.2"
+blake3 = "1"
 
 [dev-dependencies]
 # tempfile is dev-only for secure, auto-cleaning TempDir fixtures in unit tests.

@@ -43,7 +43,7 @@ pub fn truncate_display(s: &str, max_chars: usize) -> String {
 pub enum ThreadWorkMode {
     /// Waiting for the next path from the queue.
     Idle,
-    /// File size is inside the configured window — File contents read (single-byte open).
+    /// File size is inside the configured window — File contents read (complete streaming read).
     ByteRead,
     /// File size is outside the window — attributes/metadata only (no File contents read).
     AttrOnly,
@@ -119,8 +119,7 @@ pub fn shorten_path_for_display(path: &Path, strip_roots: &[&Path]) -> String {
 
 /// Column header for the live per-thread table.
 const THREAD_TABLE_HEADER: &str = "Count  Size      Action  Source filename";
-const THREAD_TABLE_RULE: &str =
-    "------------------------------------------------------------------------------------------------------";
+const THREAD_TABLE_RULE: &str = "------------------------------------------------------------------------------------------------------";
 
 /// Format one numbered worker line for the live status table.
 /// Example: `1        8.1KiB  READ    subdir/file.txt`
@@ -342,13 +341,7 @@ pub fn should_read_file_contents(len: u64, min: u64, max: i64) -> bool {
 }
 
 /// Write one CSV row for a warmed file (best-effort; errors print a warning).
-fn log_warm_row(
-    log: &WarmLog,
-    service: &str,
-    path: &Path,
-    size: Option<u64>,
-    status: &str,
-) {
+fn log_warm_row(log: &WarmLog, service: &str, path: &Path, size: Option<u64>, status: &str) {
     let Some(size) = size else {
         return;
     };
@@ -397,24 +390,32 @@ pub fn warm_file_with_hook(
 
     match fs::File::open(path) {
         Ok(mut f) => {
-            let mut buf = [0u8; 1];
-            // Empty file: open still warms; otherwise a single-byte File contents read.
-            match f.read(&mut buf) {
-                Ok(0 | 1) => WarmOutcome::ByteRead,
-                Ok(n) => {
-                    debug_assert!(n <= 1);
+            let mut buf = [0u8; 128 * 1024];
+            let mut bytes = 0u64;
+            let mut hasher = blake3::Hasher::new();
+            loop {
+                match f.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes = match bytes.checked_add(n as u64) {
+                            Some(v) => v,
+                            None => return WarmOutcome::Error,
+                        };
+                        hasher.update(&buf[..n]);
+                    }
+                    Err(e) => {
+                        eprintln!("   ⚠️  mount read {}: {e}", path.display());
+                        return WarmOutcome::Error;
+                    }
+                }
+            }
+            // A complete stream is required to populate rclone VFS. Detect concurrent changes.
+            match fs::symlink_metadata(path) {
+                Ok(after) if bytes == len && after.len() == len => {
+                    let _ = hasher.finalize();
                     WarmOutcome::ByteRead
                 }
-                Err(e) => {
-                    let msg = e.to_string().to_lowercase();
-                    if msg.contains("limit") || msg.contains("rate") || msg.contains("429") {
-                        eprintln!(
-                            "   ⚠️  Possible API limit on read (skipped file, rclone may have fetched full): {}",
-                            path.display()
-                        );
-                    }
-                    WarmOutcome::Error
-                }
+                _ => WarmOutcome::Error,
             }
         }
         Err(_) => WarmOutcome::Error,
@@ -544,7 +545,13 @@ pub fn warm_tree(
                                 WarmOutcome::ByteRead => {
                                     byte_reads.fetch_add(1, Ordering::Relaxed);
                                     if let Some(ref log) = log {
-                                        log_warm_row(log, &service_name, &path, seen_size.get(), "READ");
+                                        log_warm_row(
+                                            log,
+                                            &service_name,
+                                            &path,
+                                            seen_size.get(),
+                                            "READ",
+                                        );
                                     }
                                 }
                                 WarmOutcome::MetadataOnly => {
@@ -854,6 +861,7 @@ mod tests {
             version: 1,
             paths: vec![],
             walk: crate::config::WalkOptions {
+                checksum: true,
                 max_depth: None,
                 min_file_size_bytes: 0,
                 max_file_size_bytes: 50,

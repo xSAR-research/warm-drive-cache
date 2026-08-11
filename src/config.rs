@@ -1,19 +1,50 @@
 //! JSON configuration loader and validation for warm-drive-cache.
 //!
-//! Load order: run-dir `config.json` → `WARM_DRIVE_CACHE_CONFIG` → XDG config path.
-//! Public sample is tracked as `config.example.json`; local `config.json` is gitignored.
+//! Load order: run-dir `warm-drive-cache.json` → `WARM_DRIVE_CACHE_CONFIG` → XDG config path.
+//! Public sample is tracked as `warm-drive-cache-example.json`; local `warm-drive-cache.json` is gitignored.
 //!
 //! Size fields accept JSON integers **or** strings with optional units
 //! (`64KiB`, `64K`, `1MB`, …). See [`parse_size_expr`].
 //!
 //! See README for schema and examples. More xSAR tools: https://xSAR.com.au
 
-use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
+use serde::de::{self, Deserializer, Visitor};
 use std::env;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
+
+/// Parse the boolean vocabulary shared by JSON configuration and CLI overrides.
+pub fn parse_bool(input: &str) -> Result<bool, String> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "y" => Ok(true),
+        "false" | "no" | "n" => Ok(false),
+        _ => Err(format!(
+            "invalid boolean {input:?}; use TRUE/YES/Y or FALSE/NO/N"
+        )),
+    }
+}
+
+fn deserialize_bool<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    struct BoolVisitor;
+    impl<'de> Visitor<'de> for BoolVisitor {
+        type Value = bool;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a boolean or TRUE/YES/Y/FALSE/NO/N string")
+        }
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
+            parse_bool(v).map_err(E::custom)
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<bool, E> {
+            self.visit_str(&v)
+        }
+    }
+    d.deserialize_any(BoolVisitor)
+}
 
 // ── Human-readable size parsing ─────────────────────────────────────────────
 
@@ -100,9 +131,9 @@ pub fn parse_size_expr(input: &str) -> Result<i64, String> {
 
     let num_str = &body[..i];
     let unit = body[i..].trim();
-    let coef: f64 = num_str.parse().map_err(|_| {
-        format!("configuration error: cannot parse numeric part of size {input:?}")
-    })?;
+    let coef: f64 = num_str
+        .parse()
+        .map_err(|_| format!("configuration error: cannot parse numeric part of size {input:?}"))?;
 
     if negative {
         // Only exact -1 (no unit) is meaningful for max_file_size_bytes.
@@ -118,7 +149,9 @@ pub fn parse_size_expr(input: &str) -> Result<i64, String> {
     let mult = unit_multiplier(unit)?;
     let product = coef * mult;
     if !product.is_finite() || product < 0.0 {
-        return Err(format!("configuration error: size {input:?} is out of range"));
+        return Err(format!(
+            "configuration error: size {input:?} is out of range"
+        ));
     }
     if product > i64::MAX as f64 {
         return Err(format!(
@@ -290,6 +323,9 @@ fn default_version() -> u32 {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct WalkOptions {
+    /// Verify mount and local VFS cache contents with BLAKE3. Enabled by default.
+    #[serde(default = "default_checksum", deserialize_with = "deserialize_bool")]
+    pub checksum: bool,
     /// None (or omitted) = unlimited (exact behaviour before this feature).
     /// Some(n) = WalkDir::max_depth(n)
     pub max_depth: Option<usize>,
@@ -329,6 +365,7 @@ pub struct WalkOptions {
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
+            checksum: default_checksum(),
             max_depth: None,
             min_file_size_bytes: default_min_file_size_bytes(),
             max_file_size_bytes: default_max_file_size_bytes(),
@@ -345,6 +382,9 @@ fn default_max_file_size_bytes() -> i64 {
 }
 fn default_max_threads() -> usize {
     8
+}
+fn default_checksum() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -391,14 +431,14 @@ fn default_max_wait_secs() -> u64 {
 }
 
 /// Main entry point used by the binary.
-/// Checks the run directory (directory containing the executable) for `config.json` first.
+/// Checks the run directory (directory containing the executable) for `warm-drive-cache.json` first.
 /// Falls back to WARM_DRIVE_CACHE_CONFIG env var, then XDG ProjectDirs.
 pub fn load() -> Result<Config, String> {
-    // Check run directory (next to the binary) for config.json
+    // Check run directory (next to the binary) for warm-drive-cache.json
     if let Ok(exe) = env::current_exe()
         && let Some(run_dir) = exe.parent()
     {
-        let local = run_dir.join("config.json");
+        let local = run_dir.join("warm-drive-cache.json");
         if local.exists() {
             return load_from_path(&local);
         }
@@ -420,7 +460,7 @@ pub fn load() -> Result<Config, String> {
         }
     };
 
-    let path = config_dir.join("config.json");
+    let path = config_dir.join("warm-drive-cache.json");
     load_from_path(&path)
 }
 
@@ -541,6 +581,29 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config, String> {
     Ok(cfg)
 }
 
+/// Re-run effective configuration validation after command-line overrides.
+pub fn validate_effective(cfg: &Config) -> Result<(), String> {
+    if !(1..=64).contains(&cfg.walk.max_threads) {
+        return Err(format!(
+            "walk.max_threads must be between 1 and 64 (got {})",
+            cfg.walk.max_threads
+        ));
+    }
+    let max = cfg.walk.max_file_size_bytes;
+    if max < -1 {
+        return Err(format!(
+            "walk.max_file_size_bytes ({max}) is invalid; use -1, 0, or a positive size"
+        ));
+    }
+    if max > 0 && cfg.walk.min_file_size_bytes > max as u64 {
+        return Err(format!(
+            "walk.min_file_size_bytes ({}) cannot be greater than walk.max_file_size_bytes ({max})",
+            cfg.walk.min_file_size_bytes
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,7 +662,7 @@ mod tests {
     #[test]
     fn config_load_from_tempfile_and_validation() {
         let td = TempDir::new().expect("tempdir for config test");
-        let p = td.path().join("config.json");
+        let p = td.path().join("warm-drive-cache.json");
 
         // Good file
         {
@@ -637,7 +700,7 @@ mod tests {
 
     #[test]
     fn config_missing_file_returns_defaults_but_empty_paths() {
-        let p = std::path::Path::new("/this/path/does/not/exist/ever/config.json");
+        let p = std::path::Path::new("/this/path/does/not/exist/ever/warm-drive-cache.json");
         let c = load_from_path(p).expect("missing file yields default struct");
         // Our loader returns a struct with empty paths on missing file (caller decides what to do)
         assert!(c.paths.is_empty());
@@ -651,7 +714,7 @@ mod tests {
     #[test]
     fn config_rejects_min_greater_than_max_file_size() {
         let td = TempDir::new().expect("tempdir");
-        let p = td.path().join("config.json");
+        let p = td.path().join("warm-drive-cache.json");
         {
             let mut f = File::create(&p).unwrap();
             f.write_all(
@@ -671,7 +734,7 @@ mod tests {
     #[test]
     fn config_accepts_max_file_size_specials() {
         let td = TempDir::new().expect("tempdir");
-        let p = td.path().join("config.json");
+        let p = td.path().join("warm-drive-cache.json");
         for max in [-1i64, 0, 65536] {
             let body = format!(
                 r#"{{"paths":[{{"sync":"/abs/one","cache":"/cache/abs"}}],
@@ -687,7 +750,7 @@ mod tests {
     #[test]
     fn config_rejects_other_negative_max_file_size() {
         let td = TempDir::new().expect("tempdir");
-        let p = td.path().join("config.json");
+        let p = td.path().join("warm-drive-cache.json");
         {
             let mut f = File::create(&p).unwrap();
             f.write_all(
@@ -707,7 +770,7 @@ mod tests {
     #[test]
     fn config_rejects_bare_fractional_max_file_size() {
         let td = TempDir::new().expect("tempdir");
-        let p = td.path().join("config.json");
+        let p = td.path().join("warm-drive-cache.json");
         {
             let mut f = File::create(&p).unwrap();
             f.write_all(
@@ -746,7 +809,7 @@ mod tests {
     #[test]
     fn config_accepts_string_size_units() {
         let td = TempDir::new().expect("tempdir");
-        let p = td.path().join("config.json");
+        let p = td.path().join("warm-drive-cache.json");
         {
             let mut f = File::create(&p).unwrap();
             f.write_all(
@@ -763,7 +826,7 @@ mod tests {
     #[test]
     fn config_accepts_string_minus_one() {
         let td = TempDir::new().expect("tempdir");
-        let p = td.path().join("config.json");
+        let p = td.path().join("warm-drive-cache.json");
         {
             let mut f = File::create(&p).unwrap();
             f.write_all(
@@ -779,7 +842,7 @@ mod tests {
     #[test]
     fn config_rejects_invalid_max_threads() {
         let td = TempDir::new().expect("tempdir");
-        let p = td.path().join("config.json");
+        let p = td.path().join("warm-drive-cache.json");
         {
             let mut f = File::create(&p).unwrap();
             f.write_all(
