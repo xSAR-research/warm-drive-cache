@@ -442,8 +442,8 @@ Quit gracefully: Ctrl+C (SIGINT) or press q (TTY) — finishes in-flight workers
 
 ┌─────────────────────────────────────────────────────────────────┐
 │  warm-drive-cache                                               │
-│  Codebase Version: 0.1.0                                        │
-│  Codebase release: 18th July, 2026                              │
+│  Codebase Version: 0.2.0                                        │
+│  Codebase release: 11th August, 2026                            │
 │  Website: https://xSAR.com.au                                   │
 │  Licence: AGPL-3.0-only (see LICENSE file)                      │
 │  Homepage: https://xSAR.com.au                                  │

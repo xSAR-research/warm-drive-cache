@@ -17,7 +17,7 @@ pub const CODEBASE_VERSION: &str = PKG_VERSION;
 
 /// Codebase release date baked into the binary (universal short English form).
 /// Update this constant when cutting a release; not derived from the host clock.
-pub const CODEBASE_RELEASE: &str = "18th July, 2026";
+pub const CODEBASE_RELEASE: &str = "11th August, 2026";
 
 /// SPDX licence id from Cargo.toml (`license = "AGPL-3.0-only"`).
 pub const PKG_LICENSE: &str = env!("CARGO_PKG_LICENSE");
