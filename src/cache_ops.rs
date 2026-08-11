@@ -11,6 +11,12 @@ pub fn dir_size(path: &Path) -> u64 {
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
             let p = entry.path();
+            // The application owns this file until all cache work and reporting have finished.
+            if p.file_name()
+                .is_some_and(|name| name == crate::cache_lock::LOCK_NAME)
+            {
+                continue;
+            }
             if let Ok(meta) = fs::symlink_metadata(&p) {
                 if meta.is_file() {
                     size += meta.len();
@@ -76,6 +82,11 @@ pub fn delete_dir_contents(path: &Path, dry_run: bool) -> u64 {
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
             let p = entry.path();
+            if p.file_name()
+                .is_some_and(|name| name == crate::cache_lock::LOCK_NAME)
+            {
+                continue;
+            }
             if let Ok(meta) = fs::symlink_metadata(&p) {
                 let sz = if meta.is_file() { meta.len() } else { 0 };
                 if dry_run {

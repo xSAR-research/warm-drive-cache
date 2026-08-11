@@ -1,7 +1,10 @@
 # warm-drive-cache
 
-> External configuration via `config.json` (paths, walk depth/size gates/threads, ignore names).
-> See the "Configuration via `config.json`" section below.
+> External configuration via `warm-drive-cache.json` (paths, walk depth/size gates/threads, ignore names).
+> See the "Configuration via `warm-drive-cache.json`" section below.
+
+
+> **Checksum verification is enabled by default.** Every selected content file is streamed completely, then its local rclone VFS cache file is awaited and BLAKE3-verified. Set `walk.checksum` or `--checksum FALSE` to skip digest comparison; full reads still occur.
 
 Rust utility for maintenance of rclone FUSE mount cache directories. Part of the [xSAR](https://xSAR.com.au) toolkit.
 
@@ -12,7 +15,7 @@ Rust utility for maintenance of rclone FUSE mount cache directories. Part of the
 The cache dir is often shared across multiple sync dirs. See your rclone systemd units for the exact `--cache-dir` value.
 
 ## Configuration
-The tool loads a `config.json` file containing an array of path pairs. Each pair has:
+The tool loads a `warm-drive-cache.json` file containing an array of path pairs. Each pair has:
 - `sync`: the rclone-exposed directory to traverse and warm (size-gated **File contents read** or metadata only; concurrent workers).
 - `cache`: the rclone cache directory for size checks and deletion.
 - `service` (optional): systemd unit that mounts `sync` (system or user; name must match the real unit).
@@ -32,7 +35,7 @@ All human-readable sizes use one shared formatter (IEC binary units):
 
 Whole multiples omit decimals (`1MiB (1048576 Bytes)`); other values use two decimal places. Config fields such as `walk.max_file_size_bytes` use the same formatter when shown on screen (special values `-1` / `0` are described in words — see `walk` table below).
 
-### Size *input* in `config.json`
+### Size *input* in `warm-drive-cache.json`
 
 `min_file_size_bytes` and `max_file_size_bytes` accept either:
 
@@ -59,23 +62,38 @@ Fractional coefficients are allowed **with a unit** (e.g. `"1.5KiB"` → 1536 by
 The application reports the on-disk size of the **cache** directory before and after refresh using the formatter above. End-of-pair counters include **File contents read** and **Metadata-only** (not “1-byte reads”). The live status block shows a summary line (`dirs` / `files` / `thr active/max` / errors) plus **one line per worker** (`N of M`, compact size, `READ` or `ATTR`, path shortened by stripping the sync root / `$HOME` then truncated to 80 characters). Graceful stop: **Ctrl+C** or **q** (TTY) finishes in-flight workers and does not start new files.
 
 ## Cache Maintenance
-The tool performs a complete deletion of all files and subdirectories **in the cache directory only** (never the sync/exposed dirs) to prevent stale data accumulation. Deletion is **non-interactive** (no confirmation prompt). Use `--dry-run` to preview what would be deleted.
+Before removing cache content, the tool scans every JSON entry below `<cache-dir>/vfsMeta/<rclone-service>/`. A native or string `Dirty` value of `true` (case-insensitive) means rclone has not finished saving the modified content to its source. The tool does not purge the cache while any such entry remains. It checks the local metadata again every 1,000 ms and prints the metadata filename plus an elapsed-seconds counter on every check.
+
+Each observation opens the metadata file afresh with read-only access, reads one snapshot, and closes the handle before sleeping. The application does not apply an advisory or exclusive file lock and does not retain an open descriptor between checks, so it cannot block rclone from truncating, rewriting, or atomically replacing the file. Normal local-filesystem cache coherence makes rclone's completed write visible to the next open and directory scan. The wait is also bounded by the deadline below, so an entry cannot produce a perpetual loop.
+
+Each dirty entry may wait for one second per 4 KiB of its recorded `Size`, with a minimum of one second. `mount_wait.max_wait_secs` caps that calculated period when it is non-zero. If the entry remains dirty at the deadline, the run exits with an explanation and leaves the cache intact. Every service directory and every metadata entry is checked before deletion begins.
+
+Only after the dirty check succeeds does the tool delete files and subdirectories **in the cache directory only** (never the sync/exposed directories) to prevent stale data accumulation. The active `warm-drive-cache.lock` is always excluded. Deletion is **non-interactive** (no confirmation prompt). Use `--dry-run` to preview what would be deleted.
+
+## Concurrency Protection
+
+For each distinct cache directory, the application atomically creates an empty `warm-drive-cache.lock` file before normal processing. If the file already exists, another instance may be running or an earlier run may have ended prematurely. The prompt `Another instance of the application has been detected, do you wish to continue [y/N]?` defaults to No; only `y` or `Y` continues. Locks are removed as the final filesystem operation during normal completion, validation failure after acquisition, cancellation, and handled Ctrl+C/SIGINT shutdown. No application can remove a lock after an uncatchable SIGKILL or sudden power loss; the next run therefore treats that file as potentially stale and presents the same safe-default prompt.
+
+Do not modify, add, move, rename, or delete files in any configured rclone-mounted directory until warm-drive-cache has completed. The discovery totals, source metadata, streamed content, cache destination, and checksum comparisons are snapshots taken at different stages of the run. Concurrent user or application changes can invalidate those relationships and produce source-changed, size-mismatch, checksum-mismatch, or other unexpected outcomes. A prominent warning is printed immediately above the live thread display and as the final standalone line of help and JSON-validation output.
 
 ## Documentation & Secrets Policy
-An example config.json is provided. The README.md, all source comments, and the example file contain no concrete local paths, usernames, or sensitive values. All references use generic placeholders (e.g. rclone://example-remote/example/path or /path/to/cache). Paths are classified as secrets.
+An example warm-drive-cache.json is provided. The README.md, all source comments, and the example file contain no concrete local paths, usernames, or sensitive values. All references use generic placeholders (e.g. rclone://example-remote/example/path or /path/to/cache). Paths are classified as secrets.
 
 ## CLI options
 
 | Option | Description |
 |--------|-------------|
-| `-h`, `--help` | Brief usage, where `config.json` must live, embedded `config.example.json`, `max_file_size_bytes` specials, link to README |
+| `-?`, `-h`, `--help` | Brief usage, where `warm-drive-cache.json` must live, embedded `warm-drive-cache-example.json`, `max_file_size_bytes` specials, link to README. Help takes precedence over every other option and performs no file checks or modifications. |
+| `-j`, `--json` | Validate config layout; for each entry print **service name**, **sync directory**, **`--cache-dir` from the unit** (preferred), **current cache size**, and **systemd active/inactive (system or user)**. Second-highest priority; ignores every option except help. |
 | `-i`, `--information` | Product information only: `Codebase Version`, `Codebase release` date, AGPL-3.0-only, repo + https://xSAR.com.au (exits) |
-| `-c`, `--check` | Validate config layout; for each entry print **service name**, **sync directory**, **`--cache-dir` from the unit** (preferred), **current cache size**, and **systemd active/inactive (system or user)** |
+| `-t VALUE`, `--threads VALUE` | Override JSON worker count; validated in `1..=64`. |
+| `-s VALUE`, `--size VALUE` | Override JSON maximum using the shared size parser (`-1`, `0`, or positive size/unit). |
+| `-c VALUE`, `--checksum VALUE` | Override checksum in either direction: `TRUE`/`YES`/`Y` or `FALSE`/`NO`/`N` (case-insensitive). |
 | `-v`, `--verbose` | On a normal run: print **Configuration** and full **Pre-flight checks** detail. Quiet is the default. |
-| `-l`, `--log` | Write a time-stamped CSV under `/tmp/warm-drive-cache-YYYYMMDD-HHMMSS.csv` with columns **Service name**, **path**, **filename**, **size (bytes)**, **status** (`READ` or `ATTRIB`). Path is printed again after a blank line at program end. |
-| `--dry-run` | Simulate cache deletion only (no warm). May be combined with `-v` / `-l`. |
+| `-l`, `--log` | Write a time-stamped CSV under `/tmp/warm-drive-cache-YYYYMMDD-HHMMSS.csv` (with a process-specific suffix if that name already exists) with columns **Service name**, **path**, **filename**, **size (bytes)**, **status** (`READ` or `ATTRIB`). The path is printed again after a blank line at program end. |
+| `--dry-run` | Simulate cache deletion only (no warm). Concurrency locks are still created and removed; cache content is unchanged. May be combined with `-v` / `-l`. |
 
-**Precedence when several flags are present:** `-h` → `-i` → `-c` → normal run (with optional `-v` / `--dry-run`).
+**Precedence when several flags are present:** `-?` / `-h` / `--help` → `-j` / `--json` → `-i` / `--information` → normal run. Help ignores every other argument and exits before configuration loading, path checks, lock creation, or cache modification. JSON validation ignores every argument except a help option, loads and checks the configured JSON and paths, and performs no maintenance.
 
 Normal runs always print the startup identity banner (product of xSAR, licence, website, source). Use `-i` for the short product-information dump without loading config.
 
@@ -86,7 +104,7 @@ Normal runs always print the startup identity banner (product of xSAR, licence, 
 warm-drive-cache -i
 
 # Validate layout + service/cache report
-warm-drive-cache -c
+warm-drive-cache -j
 
 # Quiet maintenance run (default)
 warm-drive-cache
@@ -105,10 +123,10 @@ warm-drive-cache -v --dry-run
 flowchart TD
     Start[Start] --> Cli{"CLI flags?"}
 
-    Cli -->|-h / --help| Help["Print help +\nexample config.json +\nmax_file_size specials"]
+    Cli -->|-? / -h / --help| Help["Print help only; no config,\npath, lock, or cache checks"]
+    Cli -->|-j / --json| CheckBanner["Startup banner"]
     Cli -->|-i / --information| Info["Codebase Version +\nCodebase release +\nAGPL + repo + website"]
-    Cli -->|-c / --check| CheckBanner["Startup banner"]
-    CheckBanner --> CheckLoad["Load + validate config.json"]
+    CheckBanner --> CheckLoad["Load + validate warm-drive-cache.json"]
     CheckLoad --> CheckReport["Per entry:\nservice name\nsync directory\n--cache-dir from unit\ncache size IEC format\nsystemd active/inactive"]
     CheckReport --> CleanupCheck["cleanup summary"]
 
@@ -116,7 +134,12 @@ flowchart TD
     Banner --> LoadConfig["Load config\nrun-dir → env → XDG"]
     LoadConfig --> Validate{"Valid config?\npaths non-empty?\nmax_file_size OK?"}
     Validate -->|No| Error["configuration error\nexit 1"]
-    Validate -->|Yes| Verbose{"-v / --verbose?"}
+    Validate -->|Yes| Locks["Install SIGINT handler; atomically create\nwarm-drive-cache.lock in each cache"]
+    Locks --> Existing{"Lock already exists?"}
+    Existing -->|Yes| LockPrompt["Prompt to continue [y/N]"]
+    LockPrompt -->|not y/Y| LockExit["Remove acquired locks; exit 1"]
+    LockPrompt -->|y/Y| Verbose
+    Existing -->|No| Verbose{"-v / --verbose?"}
     Verbose -->|Yes| PrintCfg["Print Configuration\npaths + walk sizes +\nservices + mount_wait"]
     Verbose -->|No| ForEach["For each path pair"]
     PrintCfg --> ForEach
@@ -152,7 +175,13 @@ flowchart TD
     Dry -->|Yes| SimDelete["Simulate delete only"]
     SimDelete --> ForEach
     Dry -->|No| QuitHandlers["Install SIGINT / q\nraw TTY quit"]
-    QuitHandlers --> DeleteCache["Delete cache contents\nnon-interactive"]
+    QuitHandlers --> DirtyScan["Scan every JSON file below\nvfsMeta/service directories"]
+    DirtyScan --> HasDirty{"Any Dirty=true?"}
+    HasDirty -->|Yes| DirtyWait["Print file + elapsed seconds;\nsleep 1000 ms; scan again"]
+    DirtyWait --> DirtyLimit{"1 second per 4 KiB deadline\n(configured maximum cap) reached?"}
+    DirtyLimit -->|No| DirtyScan
+    DirtyLimit -->|Yes| DirtyFail["Leave cache intact; exit 1"]
+    HasDirty -->|No| DeleteCache["Delete cache contents except active lock\nnon-interactive"]
     DeleteCache --> WarmTree["warm_tree: WalkDir sync\nmax_depth + ignore.names"]
     WarmTree --> Workers["Worker pool max_threads\nmax=-1 metadata only\nmax=0 all File contents read\nmax=N size window"]
     Workers --> Status["Live status block\nN of M · size · READ/ATTR · path"]
@@ -162,7 +191,10 @@ flowchart TD
 
     ForEach -->|done| Cleanup["cleanup: thanks +\nGitHub issues link"]
     EndStop --> Cleanup
-    Cleanup --> End[End]
+    DirtyFail --> Cleanup
+    LockExit --> End
+    Cleanup --> RemoveLocks["Remove concurrency locks as final\nfilesystem operation"]
+    RemoveLocks --> End[End]
     Help --> End
     Info --> End
     CleanupCheck --> End
@@ -171,27 +203,29 @@ flowchart TD
     class Error,Notice,SkipSvc,FailSvc error
 ```
 
-**Flow (narrative):** optional CLI exit (`help` / `information` / `check`) → otherwise banner → load and validate config (including `max_file_size_bytes` specials) → optional **verbose Configuration** dump → for each path pair: **systemd** (detect scope; if inactive and user agrees: `daemon-reload` → `enable` → `start`, with **sudo** retry for system units; require **enabled + active**) **before** **mount settle**, then permission probes → report cache size → wipe **cache** (unless `--dry-run`) → parallel warm of **sync** (**File contents read** vs metadata per size policy) → summary. Ctrl+C / `q` finishes in-flight work only.
+**Flow (narrative):** optional CLI exit (help first, JSON validation second, information third) → otherwise banner → load and validate config (including `max_file_size_bytes` specials) → acquire one concurrency lock per cache → optional **verbose Configuration** dump → for each path pair: **systemd** (detect scope; if inactive and user agrees: `daemon-reload` → `enable` → `start`, with **sudo** retry for system units; require **enabled + active**) **before** **mount settle**, then permission probes → report cache size → scan every service directory below **`vfsMeta`** and wait for all `Dirty` entries to clear → wipe **cache** while preserving the active lock (unless `--dry-run`) → print the mounted-file modification warning immediately above the live thread display → parallel warm of **sync** (**File contents read** vs metadata per size policy) → summary → remove concurrency locks as the final filesystem operation. Ctrl+C / `q` finishes in-flight work only and removes locks during graceful shutdown.
 
-## Configuration via `config.json`
+## Configuration via `warm-drive-cache.json`
 
 The tool is configured **exclusively** via a JSON file. There are no hardcoded paths or settings in the source.
 
 ### Location (in priority order)
 
-1. **`config.json` next to the executable** (same directory as the binary). Preferred for desktop/systemd wrappers. **This file is gitignored** when it holds real paths.
+1. **`warm-drive-cache.json` next to the executable** (same directory as the binary). Preferred for desktop/systemd wrappers. **This file is gitignored** when it holds real paths.
 2. `WARM_DRIVE_CACHE_CONFIG` environment variable → full path to a `.json` file (CI / alternate profiles).
-3. XDG: `$XDG_CONFIG_HOME/warm-drive-cache/config.json` or `~/.config/warm-drive-cache/config.json`.
+3. XDG: `$XDG_CONFIG_HOME/warm-drive-cache/warm-drive-cache.json` or `~/.config/warm-drive-cache/warm-drive-cache.json`.
+
+`WARM_DRIVE_CACHE_CONFIG` is an explicit arbitrary-path override in the discovery order above; it is not a command-line option.
 
 **Tracked vs local**
 
 | File | Git | Purpose |
 |------|-----|---------|
-| `config.example.json` | tracked | Public template with **placeholders only** (no real users/paths) |
-| `config.json` | **untracked** | Your live machine paths + real systemd unit names |
+| `warm-drive-cache-example.json` | tracked | Public template with **placeholders only** (no real users/paths) |
+| `warm-drive-cache.json` | **untracked** | Your live machine paths + real systemd unit names |
 | `live.json` | **untracked** | Optional local alternate profile |
 
-Copy: `cp config.example.json config.json` (or next to `target/release/` after build) and edit.
+Copy: `cp warm-drive-cache-example.json warm-drive-cache.json` (or next to `target/release/` after build) and edit.
 
 ### Missing config behaviour
 
@@ -232,10 +266,13 @@ Each element describes **one** mount to warm and the cache directory that may be
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `checksum` | boolean or supported string | `true` | **Enabled by default.** BLAKE3-verify the completely streamed mount file against stable local VFS cache content. |
 | `max_depth` | integer or `null` | `null` | `WalkDir` max depth; `null` = unlimited. `0` is rejected. |
 | `min_file_size_bytes` | number or size string | `0` | Min size for File contents read when `max_file_size_bytes > 0`; `0` = no lower bound. Accepts bytes or unit strings (see **Size input**). Displayed with the shared IEC formatter. |
 | `max_file_size_bytes` | number or size string | `0` | **File contents read** policy (see special values). Accepts bytes or unit strings. |
 | `max_threads` | integer | `8` | Concurrent warm workers (`1`–`64`). |
+
+`walk.checksum` accepts native JSON `true` and `false`, or a quoted, case-insensitive string: `"TRUE"`, `"YES"`, `"Y"`, `"FALSE"`, `"NO"`, or `"N"`. The command-line `-c` / `--checksum` option requires one of those text values so either direction can be selected explicitly.
 
 #### `max_file_size_bytes` special values
 
@@ -314,7 +351,7 @@ Failures skip that pair; other pairs continue.
 
 In this example `"max_file_size_bytes": "64KiB"` (also valid: `65536`, `"64K"`, `"64KB"`) means File contents read for files up to **64KiB (65536 Bytes)**; larger files get metadata only. Use `0` for all sizes, or `-1` for metadata-only.
 
-### `-c` / `--check` report fields
+### `-j` / `--json` report fields
 
 For each `paths[]` entry the check mode prints a spaced group:
 
@@ -329,33 +366,33 @@ For each `paths[]` entry the check mode prints a spaced group:
 - Prefer absolute paths only; relative paths are rejected.
 - Never delete under `sync`; only warm.
 - Delete only under `cache` (non-interactive; use `--dry-run` to preview).
-- Keep `config.example.json` free of real usernames and host paths when publishing.
+- Keep `warm-drive-cache-example.json` free of real usernames and host paths when publishing.
 - Omitted sections or fields fall back to the values shown in the table above.
 - When the file is completely missing, the program still uses the defaults for `walk`, `ignore`, and `mount_wait`, but `paths` becomes empty and triggers a helpful startup error.
 
 **Safety**: The tool will refuse overlapping sync/cache paths. Always double-check your rclone service `--cache-dir` vs mount points.
 
-See also the ready-to-copy example at `config.example.json` in the repository root.
+See also the ready-to-copy example at `warm-drive-cache-example.json` in the repository root.
 
 ### Creating the file
-The build process copies `config.example.json` into the release directory (e.g. `target/release/config.example.json`).
+The build process copies `warm-drive-cache-example.json` into the release directory (e.g. `target/release/warm-drive-cache-example.json`).
 
 ```bash
 # After `cargo build --release`
-cp target/release/config.example.json target/release/config.json
-# edit target/release/config.json with your {"sync": "...", "cache": "..."} pairs
+cp target/release/warm-drive-cache-example.json target/release/warm-drive-cache.json
+# edit target/release/warm-drive-cache.json with your {"sync": "...", "cache": "..."} pairs
 ```
 
 Alternatively for XDG:
 ```bash
 mkdir -p ~/.config/warm-drive-cache
-cp config.example.json ~/.config/warm-drive-cache/config.json
+cp warm-drive-cache-example.json ~/.config/warm-drive-cache/warm-drive-cache.json
 ```
 
 ## Requirements
 
 - Rust stable (2024 edition)
-- rclone remote(s) configured (sync/cache path pairs provided via config.json; see your rclone --cache-dir)
+- rclone remote(s) configured (sync/cache path pairs provided via warm-drive-cache.json; see your rclone --cache-dir)
 - Linux (uses standard `std::fs`; developed on Arch)
 
 ## Build & run
@@ -363,7 +400,7 @@ cp config.example.json ~/.config/warm-drive-cache/config.json
 ```bash
 cargo build --release
 ./target/release/warm-drive-cache -i          # product information
-./target/release/warm-drive-cache -c          # config / service check
+./target/release/warm-drive-cache -j          # config / service check
 ./target/release/warm-drive-cache             # quiet maintenance run
 ./target/release/warm-drive-cache -v          # verbose Configuration + Pre-flight
 ./target/release/warm-drive-cache --dry-run   # simulate cache wipe only
@@ -373,7 +410,7 @@ Optional install to a directory on your `PATH` (e.g. `~/.local/bin`):
 
 ```bash
 cp target/release/warm-drive-cache ~/.local/bin/
-# place config.json next to the binary, or use WARM_DRIVE_CACHE_CONFIG / XDG
+# place warm-drive-cache.json next to the binary, or use WARM_DRIVE_CACHE_CONFIG / XDG
 ```
 
 Debug build:
@@ -393,7 +430,7 @@ cargo test should_read_file      # File contents read policy
 cargo test parse_cli             # CLI flags
 ```
 
-Unit tests cover the pure helpers and core logic using synthetic `tempfile` trees only. Production paths are never exercised by tests (paths are loaded from config.json and treated as secrets).
+Unit tests cover the pure helpers and core logic using synthetic `tempfile` trees only. Production paths are never exercised by tests (paths are loaded from warm-drive-cache.json and treated as secrets).
 
 ## Example output
 
@@ -405,8 +442,8 @@ Quit gracefully: Ctrl+C (SIGINT) or press q (TTY) — finishes in-flight workers
 
 ┌─────────────────────────────────────────────────────────────────┐
 │  warm-drive-cache                                               │
-│  Codebase Version: 0.1.0                                        │
-│  Codebase release: 18th July, 2026                              │
+│  Codebase Version: 0.2.0                                        │
+│  Codebase release: 11th August, 2026                            │
 │  Website: https://xSAR.com.au                                   │
 │  Licence: AGPL-3.0-only (see LICENSE file)                      │
 │  Homepage: https://xSAR.com.au                                  │
@@ -528,7 +565,7 @@ WantedBy=default.target
 
 **Notes on the sample:**
 - Uses systemd specifiers like `%h` (expands to the user's home directory) so the unit is easy to reuse.
-- The `--cache-dir` points to the rclone cache directory used by the mount (see your `config.json` for the exact value used by `warm-drive-cache`).
+- The `--cache-dir` points to the rclone cache directory used by the mount (see your `warm-drive-cache.json` for the exact value used by `warm-drive-cache`).
 - A similar unit can be created for another remote (e.g. `gdrive-archive.service` pointing at the `archive` remote and its mount/cache paths).
 - You can create a systemd user timer (or use `warm-drive-cache` directly via a timer) that starts after these mounts are active.
 
@@ -539,3 +576,12 @@ For more tools, guides, and projects, visit [xSAR](https://xSAR.com.au).
 ## Licence
 
 This project is licensed under the [GNU Affero General Public License v3.0 only](LICENSE) (AGPL-3.0-only). See the `LICENSE` file for the full text.
+## rclone VFS cache layout and verification assumptions
+
+The resolver expects rclone's content layout `<cache-dir>/vfs/<remote-name>/<remote-path>`, not files directly below `--cache-dir`. A shared cache must resolve unambiguously to the remote used by the mount. Mount-relative paths are mapped beneath that remote directory; existing parents are canonicalized and traversal outside the configured cache root is rejected. Filenames remain native OS strings (no lossy conversion).
+
+Selected content files are streamed fully and incrementally through BLAKE3. The worker retains its slot while polling only the local cache destination (500 ms, finite 30 second timeout, two stable observations), which avoids repeated remote API requests and provides thread-count backpressure. Attribute-only files are never opened and verification is reported as not applicable. Disabling checksums still performs the full mount read and cache stability/size checks.
+
+Before warming, eligible content bytes should be aggregated for cache paths on the same filesystem. Projected use above 90% is a warning, not a refusal; metadata-only files contribute zero bytes. Dry runs cannot claim post-cleanup free space because deletion was simulated. Sparse files, hard links, duplicate mappings, inaccessible/changing metadata, and saturating overflow must be reported conservatively.
+
+`-j` / `--json` validates every pair rather than accepting the first usable pair. It checks absolute/non-overlapping paths, directory existence and read/traverse access, and cache modification access with a uniquely named create/remove probe. Service syntax/discoverability is reported separately without changing systemd state.

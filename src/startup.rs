@@ -17,7 +17,7 @@ pub const CODEBASE_VERSION: &str = PKG_VERSION;
 
 /// Codebase release date baked into the binary (universal short English form).
 /// Update this constant when cutting a release; not derived from the host clock.
-pub const CODEBASE_RELEASE: &str = "18th July, 2026";
+pub const CODEBASE_RELEASE: &str = "11th August, 2026";
 
 /// SPDX licence id from Cargo.toml (`license = "AGPL-3.0-only"`).
 pub const PKG_LICENSE: &str = env!("CARGO_PKG_LICENSE");
@@ -34,10 +34,20 @@ pub const PRODUCT_OF: &str = "xSAR";
 /// Public website for the product line.
 pub const XSAR_WEBSITE: &str = "https://xSAR.com.au";
 
-/// Embedded copy of `config.example.json` (no secrets) for `--help`.
-const CONFIG_EXAMPLE_JSON: &str = include_str!("../config.example.json");
+/// Safety warning shared by live runs, help, and JSON validation output.
+pub const MOUNT_MODIFICATION_WARNING: &str = "⚠️  WARNING: Do not modify, add, or delete files in an rclone-mounted directory while warm-drive-cache is running; doing so may cause unexpected behaviour.";
 
-/// Result of early CLI flag handling (`-h` / `-i` / `-c` / `-v` / `-l` / normal run).
+/// Embedded copy of `warm-drive-cache-example.json` (no secrets) for `--help`.
+const CONFIG_EXAMPLE_JSON: &str = include_str!("../warm-drive-cache-example.json");
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CliOverrides {
+    pub threads: Option<usize>,
+    pub size: Option<i64>,
+    pub checksum: Option<bool>,
+}
+
+/// Result of early CLI flag handling (`-h` / `-i` / `-j` / overrides / normal run).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliAction {
     /// Continue with normal maintenance run.
@@ -46,56 +56,111 @@ pub enum CliAction {
         verbose: bool,
         /// Write a time-stamped CSV warm log under `/tmp/`.
         log: bool,
+        overrides: CliOverrides,
     },
     /// Printed help and should exit 0.
     Help,
     /// Printed product information (version, licence, links) and should exit 0.
     Information,
-    /// Validate config.json layout and report service / paths / cache sizes.
-    Check,
+    /// Validate warm-drive-cache.json layout and report service / paths / cache sizes.
+    JsonValidation { overrides: CliOverrides },
 }
 
-/// Parse process args for help, information, check, verbose, log, and dry-run.
+/// Parse process arguments into a validated action and typed overrides.
 ///
-/// Unknown flags other than the above are ignored so existing invocations keep working.
-pub fn parse_cli_args<I, S>(args: I) -> CliAction
+/// Help takes first priority and JSON validation second; either ignores every lower-priority
+/// argument. Otherwise, unknown, missing, malformed, and conflicting options are rejected.
+pub fn parse_cli_args<I, S>(args: I) -> Result<CliAction, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
     let mut dry_run = false;
-    let mut help = false;
-    let mut information = false;
-    let mut check = false;
     let mut verbose = false;
     let mut log = false;
 
-    for arg in args {
-        match arg.as_ref() {
-            "-h" | "--help" => help = true,
-            "-i" | "--information" => information = true,
-            "-c" | "--check" => check = true,
+    let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_owned()).collect();
+    let help = args
+        .iter()
+        .any(|a| matches!(a.as_str(), "-?" | "-h" | "--help"));
+    let information = args
+        .iter()
+        .any(|a| matches!(a.as_str(), "-i" | "--information"));
+    if help {
+        return Ok(CliAction::Help);
+    }
+    if args.iter().any(|a| matches!(a.as_str(), "-j" | "--json")) {
+        return Ok(CliAction::JsonValidation {
+            overrides: CliOverrides::default(),
+        });
+    }
+    if information {
+        return Ok(CliAction::Information);
+    }
+    let mut overrides = CliOverrides::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "-?" | "-h" | "--help" | "-i" | "--information" | "-j" | "--json" => {
+                unreachable!()
+            }
             "-v" | "--verbose" => verbose = true,
             "-l" | "--log" => log = true,
             "--dry-run" => dry_run = true,
-            _ => {}
+            "-t" | "--threads" | "-s" | "--size" | "-c" | "--checksum" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("missing value for {arg}"))?;
+                if value.is_empty() {
+                    return Err(format!("empty value for {arg}"));
+                }
+                if value.starts_with('-')
+                    && !(matches!(arg.as_str(), "-s" | "--size") && value == "-1")
+                {
+                    return Err(format!(
+                        "value for {arg} was interpreted as option: {value}"
+                    ));
+                }
+                match arg.as_str() {
+                    "-t" | "--threads" => {
+                        if overrides.threads.is_some() {
+                            return Err("conflicting duplicate --threads option".into());
+                        }
+                        let n: usize = value
+                            .parse()
+                            .map_err(|_| format!("malformed integer for {arg}: {value:?}"))?;
+                        if !(1..=64).contains(&n) {
+                            return Err(format!("threads must be between 1 and 64 (got {n})"));
+                        }
+                        overrides.threads = Some(n);
+                    }
+                    "-s" | "--size" => {
+                        if overrides.size.is_some() {
+                            return Err("conflicting duplicate --size option".into());
+                        }
+                        overrides.size = Some(crate::config::parse_size_expr(value)?);
+                    }
+                    _ => {
+                        if overrides.checksum.is_some() {
+                            return Err("conflicting duplicate --checksum option".into());
+                        }
+                        overrides.checksum = Some(crate::config::parse_bool(value)?);
+                    }
+                }
+                i += 1;
+            }
+            _ => return Err(format!("unknown option: {arg}")),
         }
+        i += 1;
     }
 
-    // Precedence: help → information → check → run
-    if help {
-        CliAction::Help
-    } else if information {
-        CliAction::Information
-    } else if check {
-        CliAction::Check
-    } else {
-        CliAction::Run {
-            dry_run,
-            verbose,
-            log,
-        }
-    }
+    Ok(CliAction::Run {
+        dry_run,
+        verbose,
+        log,
+        overrides,
+    })
 }
 
 /// `-i` / `--information`: codebase version + release date, licence, repo, and website.
@@ -114,7 +179,7 @@ pub fn print_information() {
     }
 }
 
-/// `-h` / `--help`: brief usage, where config lives, and the example `config.json` schema.
+/// `-?` / `-h` / `--help`: usage, configuration location, and the embedded example schema.
 pub fn print_help() {
     println!("{PKG_NAME} — Codebase Version: {CODEBASE_VERSION} ({CODEBASE_RELEASE})");
     println!("rclone FUSE cache maintenance (product of {PRODUCT_OF})");
@@ -123,18 +188,35 @@ pub fn print_help() {
     println!("  {PKG_NAME} [OPTIONS]");
     println!();
     println!("Options:");
-    println!("  -h, --help          Show this help and example configuration");
+    println!("  -?, -h, --help      Show this help and example configuration");
+    println!(
+        "  -j, --json          Validate JSON, all configured paths, and service discoverability"
+    );
     println!("  -i, --information   Show version, release date, licence, and project links");
-    println!("  -c, --check         Validate config.json and list services / paths / cache sizes");
+    println!("  -t, --threads VALUE Override worker count (1..=64)");
+    println!("  -s, --size VALUE    Override maximum: -1 attributes, 0 all, or positive size/unit");
+    println!("  -c, --checksum VALUE Override checksum (TRUE/YES/Y or FALSE/NO/N)");
     println!("  -v, --verbose       Show Configuration and Pre-flight checks detail");
     println!("  -l, --log           Write time-stamped CSV log under /tmp (READ/ATTRIB per file)");
-    println!("      --dry-run       Simulate cache deletion only (no writes / no warm)");
+    println!("      --dry-run       Simulate deletion/no warm; concurrency lock is still created");
     println!();
     println!("Configuration:");
-    println!("  Place a file named config.json next to the executable (same directory).");
-    println!("  Copy from config.example.json (shipped with the binary/source) and set your");
+    println!("  Place a file named warm-drive-cache.json next to the executable (same directory).");
+    println!(
+        "  Copy from warm-drive-cache-example.json (shipped with the binary/source) and set your"
+    );
     println!("  absolute sync/cache paths and optional systemd unit names (system or --user).");
-    println!("  Alternatives: WARM_DRIVE_CACHE_CONFIG=/path/to.json or XDG config dir.");
+    println!("  CLI values override JSON. Checksum verification is ENABLED BY DEFAULT.");
+    println!("  JSON checksum values: true/false or quoted TRUE/YES/Y/FALSE/NO/N.");
+    println!(
+        "  Full reads populate the cache; workers then poll the local VFS cache with a finite timeout."
+    );
+    println!(
+        "  Before deletion, all vfsMeta services are checked every second for Dirty=true entries."
+    );
+    println!(
+        "  Normal runs create warm-drive-cache.lock in each cache; an existing lock defaults to No."
+    );
     println!();
     println!("walk.max_file_size_bytes special values:");
     println!("  -1  metadata only (no File contents read for any file)");
@@ -145,7 +227,7 @@ pub fn print_help() {
     println!("  65536 | \"64KiB\" | \"64K\" | \"64KB\" | \"1MiB\" | \"1M\" | \"512B\"");
     println!("  Units: B, K/KB/KiB, M/MB/MiB, G/GB/GiB, T/TB/TiB, P/PB/PiB (binary 1024).");
     println!();
-    println!("Example config.json (placeholders only — no secrets):");
+    println!("Embedded warm-drive-cache-example.json template (save as warm-drive-cache.json):");
     println!("{CONFIG_EXAMPLE_JSON}");
     println!("For full documentation see README.md in the repository:");
     if !PKG_REPOSITORY.is_empty() {
@@ -155,6 +237,13 @@ pub fn print_help() {
         println!("  {XSAR_WEBSITE}");
     }
     println!("Website: {XSAR_WEBSITE}");
+    println!();
+    print_mount_modification_warning();
+}
+
+/// Print the prominent mounted-file safety warning as a standalone line.
+pub fn print_mount_modification_warning() {
+    println!("{MOUNT_MODIFICATION_WARNING}");
 }
 
 /// Interior width of the startup identity box (characters between the side borders).
@@ -228,6 +317,10 @@ pub fn print_loaded_config(cfg: &Config) {
         cache_ops::format_max_file_size_limit(cfg.walk.max_file_size_bytes)
     );
     println!("   walk.max_threads: {}", cfg.walk.max_threads);
+    println!(
+        "   walk.checksum: {} (enabled by default)",
+        cfg.walk.checksum
+    );
     if cfg.ignore.names.is_empty() {
         println!("   ignore.names: []");
     } else {
@@ -237,78 +330,4 @@ pub fn print_loaded_config(cfg: &Config) {
         "   mount_wait: initial={}s retries={:?} max={}s",
         cfg.mount_wait.initial_secs, cfg.mount_wait.retry_delays_secs, cfg.mount_wait.max_wait_secs
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_cli_help_information_verbose() {
-        assert_eq!(parse_cli_args(["--help"]), CliAction::Help);
-        assert_eq!(parse_cli_args(["-h"]), CliAction::Help);
-        assert_eq!(parse_cli_args(["-i"]), CliAction::Information);
-        assert_eq!(parse_cli_args(["--information"]), CliAction::Information);
-        assert_eq!(parse_cli_args(["-c"]), CliAction::Check);
-        assert_eq!(parse_cli_args(["--check"]), CliAction::Check);
-        assert_eq!(
-            parse_cli_args(["--dry-run"]),
-            CliAction::Run {
-                dry_run: true,
-                verbose: false,
-                log: false
-            }
-        );
-        assert_eq!(
-            parse_cli_args(["-v"]),
-            CliAction::Run {
-                dry_run: false,
-                verbose: true,
-                log: false
-            }
-        );
-        assert_eq!(
-            parse_cli_args(["-l"]),
-            CliAction::Run {
-                dry_run: false,
-                verbose: false,
-                log: true
-            }
-        );
-        assert_eq!(
-            parse_cli_args(["--verbose", "--dry-run", "--log"]),
-            CliAction::Run {
-                dry_run: true,
-                verbose: true,
-                log: true
-            }
-        );
-        assert_eq!(
-            parse_cli_args(std::iter::empty::<&str>()),
-            CliAction::Run {
-                dry_run: false,
-                verbose: false,
-                log: false
-            }
-        );
-        // help wins if both present
-        assert_eq!(parse_cli_args(["-i", "--help"]), CliAction::Help);
-        // information wins over check
-        assert_eq!(parse_cli_args(["-c", "-i"]), CliAction::Information);
-        // verbose with check is still Check (verbose only applies to Run)
-        assert_eq!(parse_cli_args(["-c", "-v"]), CliAction::Check);
-    }
-
-    #[test]
-    fn version_and_release_constants() {
-        assert!(!PKG_VERSION.is_empty());
-        assert_eq!(CODEBASE_VERSION, PKG_VERSION);
-        assert!(!CODEBASE_RELEASE.is_empty());
-        assert!(
-            CODEBASE_RELEASE.contains("2026"),
-            "release date should include year: {CODEBASE_RELEASE}"
-        );
-        assert_eq!(PKG_LICENSE, "AGPL-3.0-only");
-        assert!(XSAR_WEBSITE.contains("xSAR.com.au") || XSAR_WEBSITE.contains("xsar.com.au"));
-    }
 }

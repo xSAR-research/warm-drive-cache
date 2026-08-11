@@ -8,7 +8,7 @@
 //!
 //! Module map (see README mermaid “Program Flow”):
 //! - [`startup`] — product banner + print resolved config
-//! - [`config`] — JSON load / validation (`config.json`)
+//! - [`config`] — JSON load / validation (`warm-drive-cache.json`)
 //! - [`cache_check`] — systemd unit status, start prompt, FS permission probes
 //! - [`shutdown`] — SIGINT / TTY `q` graceful stop
 //! - [`cache_ops`] — cache size + non-interactive delete
@@ -18,9 +18,11 @@
 //! - [`mount_wait`] — optional FUSE settle helpers
 
 mod cache_check;
+mod cache_lock;
 mod cache_ops;
 mod cleanup;
 mod config;
+mod dirty_check;
 mod mount_wait;
 mod shutdown;
 mod startup;
@@ -32,74 +34,136 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn main() {
-    // Early CLI: -h/--help, -i/--information, -c/--check exit before (or without) maintenance.
+    // Early CLI: -h/--help, -i/--information, -j/--json exit before (or without) maintenance.
     match startup::parse_cli_args(std::env::args().skip(1)) {
-        startup::CliAction::Help => startup::print_help(),
-        startup::CliAction::Information => startup::print_information(),
-        startup::CliAction::Check => run_check(),
-        startup::CliAction::Run {
+        Err(e) => {
+            eprintln!("❌ command-line error: {e}");
+            eprintln!("Try --help for usage.");
+            std::process::exit(2);
+        }
+        Ok(startup::CliAction::Help) => startup::print_help(),
+        Ok(startup::CliAction::Information) => startup::print_information(),
+        Ok(startup::CliAction::JsonValidation { overrides }) => run_check(overrides),
+        Ok(startup::CliAction::Run {
             dry_run,
             verbose,
             log,
-        } => run(dry_run, verbose, log),
+            overrides,
+        }) => {
+            if !run(dry_run, verbose, log, overrides) {
+                std::process::exit(1);
+            }
+        }
     }
 }
 
-/// Load and validate config.json, then print a grouped service / path / cache report.
-fn run_check() {
+/// Load and validate warm-drive-cache.json, then print a grouped service / path / cache report.
+fn apply_overrides(cfg: &mut config::Config, o: startup::CliOverrides) -> Result<(), String> {
+    if let Some(v) = o.threads {
+        cfg.walk.max_threads = v;
+    }
+    if let Some(v) = o.size {
+        cfg.walk.max_file_size_bytes = v;
+    }
+    if let Some(v) = o.checksum {
+        cfg.walk.checksum = v;
+    }
+    config::validate_effective(cfg)
+}
+
+fn run_check(overrides: startup::CliOverrides) {
     startup::print_startup_banner();
-    let cfg = match config::load() {
+    let mut cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("❌ warm-drive-cache configuration error: {}", e);
             eprintln!(
-                "   Place config.json next to the executable, or set WARM_DRIVE_CACHE_CONFIG."
+                "   Place warm-drive-cache.json next to the executable, or set WARM_DRIVE_CACHE_CONFIG."
             );
             cleanup::print_exit_summary(false);
+            startup::print_mount_modification_warning();
             std::process::exit(1);
         }
     };
+    if let Err(e) = apply_overrides(&mut cfg, overrides) {
+        eprintln!("❌ effective configuration error: {e}");
+        startup::print_mount_modification_warning();
+        std::process::exit(1);
+    }
     if cfg.paths.is_empty() {
-        eprintln!("❌ No paths configured in config.json.");
+        eprintln!("❌ No paths configured in warm-drive-cache.json.");
         cleanup::print_exit_summary(false);
+        startup::print_mount_modification_warning();
         std::process::exit(1);
     }
     let ok = cache_check::run_config_check(&cfg);
     cleanup::print_exit_summary(false);
+    startup::print_mount_modification_warning();
     if !ok {
         std::process::exit(1);
     }
 }
 
-fn run(dry_run: bool, verbose: bool, log: bool) {
+fn run(dry_run: bool, verbose: bool, log: bool, overrides: startup::CliOverrides) -> bool {
     // Banner: product of xSAR, website, AGPL-3.0-only (baked from Cargo.toml).
     startup::print_startup_banner();
 
     // JSON config (run-dir / env / XDG). Paths are secrets — never hardcoded.
-    let cfg = match config::load() {
+    let mut cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("❌ warm-drive-cache configuration error: {}", e);
-            eprintln!("   Typical location: config.json next to the binary (run directory)");
             eprintln!(
-                "   Copy from config.example.json and set your local paths (config.json is gitignored)."
+                "   Typical location: warm-drive-cache.json next to the binary (run directory)"
             );
-            eprintln!("   Override with: WARM_DRIVE_CACHE_CONFIG=/path/to/config.json");
+            eprintln!(
+                "   Copy from warm-drive-cache-example.json and set your local paths (warm-drive-cache.json is gitignored)."
+            );
+            eprintln!("   Override with: WARM_DRIVE_CACHE_CONFIG=/path/to/warm-drive-cache.json");
             eprintln!("   See the configuration section in the README.");
             cleanup::print_exit_summary(false);
-            std::process::exit(1);
+            return false;
         }
     };
+    if let Err(e) = apply_overrides(&mut cfg, overrides) {
+        eprintln!("❌ effective configuration error: {e}");
+        return false;
+    }
 
     if cfg.paths.is_empty() {
         eprintln!("❌ No paths configured.");
         eprintln!(
-            "   Create config.json (gitignored) from config.example.json with at least one path pair \
+            "   Create warm-drive-cache.json (gitignored) from warm-drive-cache-example.json with at least one path pair \
              (sync, cache, optional service)."
         );
         eprintln!("   Example is documented in the README.");
         cleanup::print_exit_summary(false);
-        std::process::exit(1);
+        return false;
+    }
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    shutdown::install_sigint_handler(Arc::clone(&shutdown));
+
+    // Acquire one atomic warning lock per distinct cache before any cache is inspected or changed.
+    let mut cache_locks = Vec::new();
+    let mut locked_paths = std::collections::HashSet::new();
+    for pair in &cfg.paths {
+        if locked_paths.insert(pair.cache.clone()) {
+            match cache_lock::CacheLock::acquire(Path::new(&pair.cache)) {
+                Ok(lock) => {
+                    if verbose {
+                        println!("   Concurrency lock: {}", lock.path().display());
+                    }
+                    cache_locks.push(lock);
+                }
+                Err(e) => {
+                    eprintln!("❌ Concurrency protection: {e}");
+                    cleanup::print_exit_summary(true);
+                    drop(cache_locks);
+                    return false;
+                }
+            }
+        }
     }
 
     if verbose {
@@ -115,16 +179,17 @@ fn run(dry_run: bool, verbose: bool, log: bool) {
             Err(e) => {
                 eprintln!("❌ warm-drive-cache log error: {e}");
                 cleanup::print_exit_summary(false);
-                std::process::exit(1);
+                drop(cache_locks);
+                return false;
             }
         }
     } else {
         None
     };
 
-    let shutdown = Arc::new(AtomicBool::new(false));
     // Installed after interactive pre-flight prompts so Y/n uses cooked stdin.
     let mut stdin_guard = None;
+    let mut fatal_error = false;
 
     for pair in &cfg.paths {
         if shutdown.load(Ordering::SeqCst) {
@@ -143,6 +208,14 @@ fn run(dry_run: bool, verbose: bool, log: bool) {
         let before = cache_ops::dir_size(cache_path);
         println!("\n📂 Sync dir (traverse/warm only): {}", pair.sync);
         println!("   Cache dir (size/delete only): {}", pair.cache);
+        println!(
+            "   Checksum verification: {}",
+            if cfg.walk.checksum {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
         if let Some(svc) = &pair.service {
             println!("   systemd unit: {svc}");
         }
@@ -162,8 +235,18 @@ fn run(dry_run: bool, verbose: bool, log: bool) {
         }
 
         if stdin_guard.is_none() {
-            stdin_guard = Some(shutdown::install_graceful_shutdown(Arc::clone(&shutdown)));
+            stdin_guard = shutdown::install_quit_listener(Arc::clone(&shutdown));
         }
+
+        println!("   Checking rclone vfsMeta entries for unsaved files...");
+        if let Err(e) =
+            dirty_check::wait_until_clean(cache_path, cfg.mount_wait.max_wait_secs, &shutdown)
+        {
+            eprintln!("❌ Cache purge cancelled: {e}");
+            fatal_error = true;
+            break;
+        }
+        println!("   ✓ No Dirty=true rclone metadata entries remain.");
 
         println!("   Performing complete deletion of all files and subdirectories in cache dir...");
         let deleted = cache_ops::delete_dir_contents(cache_path, false);
@@ -180,6 +263,7 @@ fn run(dry_run: bool, verbose: bool, log: bool) {
             cache_ops::format_bytes(cfg.walk.min_file_size_bytes),
             cache_ops::format_max_file_size_limit(cfg.walk.max_file_size_bytes)
         );
+        startup::print_mount_modification_warning();
         println!();
         let service_name = pair
             .service
@@ -187,13 +271,8 @@ fn run(dry_run: bool, verbose: bool, log: bool) {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("");
-        let mut status = worker::warm_tree(
-            sync_path,
-            &cfg,
-            &shutdown,
-            service_name,
-            warm_log.as_ref(),
-        );
+        let mut status =
+            worker::warm_tree(sync_path, &cfg, &shutdown, service_name, warm_log.as_ref());
         status.finish_line();
 
         let after_warm = cache_ops::dir_size(cache_path);
@@ -227,4 +306,9 @@ fn run(dry_run: bool, verbose: bool, log: bool) {
         println!();
         println!("CSV log written to: {}", log.path().display());
     }
+
+    // Lock removal is deliberately the final filesystem operation on a normal/graceful exit.
+    drop(warm_log);
+    drop(cache_locks);
+    !fatal_error
 }
