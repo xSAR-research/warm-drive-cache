@@ -46,16 +46,19 @@ impl Drop for StdinRawGuard {
     }
 }
 
-/// Install SIGINT (ctrlc) and optional `q` key listener. Both set `shutdown`.
-/// Returns a termios guard that must be held for the process lifetime of quit listening.
-pub fn install_graceful_shutdown(shutdown: Arc<AtomicBool>) -> Option<StdinRawGuard> {
+/// Install the SIGINT/Ctrl+C handler without changing terminal input mode.
+pub fn install_sigint_handler(shutdown: Arc<AtomicBool>) {
     let flag = Arc::clone(&shutdown);
     if let Err(e) = ctrlc::set_handler(move || {
         flag.store(true, Ordering::SeqCst);
     }) {
         eprintln!("   ⚠️  Could not install SIGINT handler: {e}");
     }
+}
 
+/// Install the optional `q` key listener after all interactive prompts have completed.
+/// Returns a termios guard that must be held for the process lifetime of quit listening.
+pub fn install_quit_listener(shutdown: Arc<AtomicBool>) -> Option<StdinRawGuard> {
     let term_guard = StdinRawGuard::enable();
     if term_guard.is_some() {
         let flag = Arc::clone(&shutdown);

@@ -18,14 +18,31 @@ struct WarmLogInner {
 
 impl WarmLog {
     /// Create `/tmp/warm-drive-cache-YYYYMMDD-HHMMSS.csv` with a header row.
+    /// A process-specific suffix is added if another logger used the same second.
     pub fn create() -> Result<Self, String> {
         let stamp = local_timestamp_slug();
-        let path = PathBuf::from(format!("/tmp/warm-drive-cache-{stamp}.csv"));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| format!("cannot create log file {}: {e}", path.display()))?;
+        let mut selected = None;
+        for attempt in 0..100u8 {
+            let suffix = if attempt == 0 {
+                String::new()
+            } else {
+                format!("-{}-{attempt}", std::process::id())
+            };
+            let path = PathBuf::from(format!("/tmp/warm-drive-cache-{stamp}{suffix}.csv"));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    selected = Some((path, file));
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(format!("cannot create log file {}: {e}", path.display()));
+                }
+            }
+        }
+        let (path, mut file) = selected.ok_or_else(|| {
+            format!("cannot create a unique warm log for timestamp {stamp} after 100 attempts")
+        })?;
         writeln!(file, "Service name,path,filename,size (bytes),status")
             .map_err(|e| format!("cannot write log header {}: {e}", path.display()))?;
         file.flush()
@@ -129,10 +146,11 @@ mod tests {
         let log = WarmLog::create().expect("create log");
         let path = log.path().to_path_buf();
         assert!(path.starts_with("/tmp/"));
-        assert!(path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("warm-drive-cache-") && n.ends_with(".csv")));
+        assert!(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("warm-drive-cache-") && n.ends_with(".csv"))
+        );
         log.log_file("svc.service", "/tmp/dir", "file.txt", 42, "READ")
             .unwrap();
         log.flush().unwrap();

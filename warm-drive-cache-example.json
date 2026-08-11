@@ -13,6 +13,7 @@
     }
   ],
   "walk": {
+    "checksum": true,
     "max_depth": null,
     "min_file_size_bytes": 0,
     "max_file_size_bytes": "64KiB",

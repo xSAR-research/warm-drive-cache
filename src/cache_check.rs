@@ -197,10 +197,7 @@ fn ensure_service_ready(
     }
 
     // Always surface inactive state (needs a decision).
-    println!(
-        "   ⚠️  systemd ({}): {unit} is not active",
-        scope.label()
-    );
+    println!("   ⚠️  systemd ({}): {unit} is not active", scope.label());
 
     if dry_run {
         println!("   --dry-run: would ask to start {unit}; treating as skip for live warm path");
@@ -246,7 +243,7 @@ fn ensure_service_ready(
     ))
 }
 
-/// `-c` / `--check`: validate loaded config layout and print a clear report per service.
+/// `-j` / `--json`: validate loaded JSON, paths, and service discoverability.
 ///
 /// For each path pair, groups:
 /// - service name (systemd system or user unit)
@@ -258,17 +255,18 @@ fn ensure_service_ready(
 pub fn run_config_check(cfg: &Config) -> bool {
     println!();
     println!("════════════════════════════════════════════════════════════");
-    println!("  Config check  (−c / --check)");
+    println!("  JSON validation  (-j / --json)");
     println!("════════════════════════════════════════════════════════════");
     println!();
     println!("Schema version:  {}", cfg.version);
     println!("Path pairs:      {}", cfg.paths.len());
     println!(
-        "Walk:            max_depth={:?}  min_size={}  max_size={}  max_threads={}",
+        "Walk:            max_depth={:?}  min_size={}  max_size={}  max_threads={} checksum={}",
         cfg.walk.max_depth,
         cache_ops::format_bytes(cfg.walk.min_file_size_bytes),
         cache_ops::format_max_file_size_limit(cfg.walk.max_file_size_bytes),
-        cfg.walk.max_threads
+        cfg.walk.max_threads,
+        cfg.walk.checksum
     );
     println!("Ignore names:    {:?}", cfg.ignore.names);
     println!(
@@ -302,6 +300,10 @@ pub fn run_config_check(cfg: &Config) -> bool {
         println!("    {}", pair.sync);
         if Path::new(&pair.sync).is_dir() {
             println!("    status: present (directory)");
+            if let Err(e) = check_sync_readable(Path::new(&pair.sync)) {
+                println!("    access: failed: {e}");
+                all_ok = false;
+            }
         } else {
             println!("    status: missing or not a directory");
             all_ok = false;
@@ -343,11 +345,16 @@ pub fn run_config_check(cfg: &Config) -> bool {
                 "    current size:           {}",
                 cache_ops::format_bytes(bytes)
             );
+            if let Err(e) = check_cache_permissions(cache_path) {
+                println!("    access:                 failed: {e}");
+                all_ok = false;
+            }
         } else if cache_path.exists() {
             println!("    current size:           (path exists but is not a directory)");
             all_ok = false;
         } else {
-            println!("    current size:           (directory does not exist yet)");
+            println!("    current size:           (directory does not exist)");
+            all_ok = false;
         }
 
         if !service.starts_with('(') {
@@ -481,12 +488,8 @@ fn is_unit_active(unit: &str, scope: SystemdScope) -> Result<bool, String> {
 fn is_unit_enabled(unit: &str, scope: SystemdScope) -> Result<bool, String> {
     // is-enabled: 0 = enabled (or enabled-runtime / static treated as success for --quiet varies).
     // Use non-quiet and accept "enabled" / "enabled-runtime" / "static" / "alias" as OK.
-    let out = systemctl_output(scope, &["is-enabled", unit]).map_err(|e| {
-        format!(
-            "cannot run systemctl {} is-enabled: {e}",
-            scope.label()
-        )
-    })?;
+    let out = systemctl_output(scope, &["is-enabled", unit])
+        .map_err(|e| format!("cannot run systemctl {} is-enabled: {e}", scope.label()))?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let ok = matches!(
         text.as_str(),
@@ -572,11 +575,8 @@ fn systemctl_mut(scope: SystemdScope, args: &[&str]) -> Result<std::process::Out
 /// Resolve unit file path and check that the file and its parent directory are readable.
 fn check_unit_file_permissions(unit: &str) -> Result<String, String> {
     let scope = resolve_unit_scope(unit)?;
-    let out = systemctl_output(
-        scope,
-        &["show", "-p", "FragmentPath", "--value", unit],
-    )
-    .map_err(|e| format!("systemctl {} show FragmentPath: {e}", scope.label()))?;
+    let out = systemctl_output(scope, &["show", "-p", "FragmentPath", "--value", unit])
+        .map_err(|e| format!("systemctl {} show FragmentPath: {e}", scope.label()))?;
     if !out.status.success() {
         return Err(format!(
             "could not resolve unit path for {unit} (not installed as {} unit?)",
