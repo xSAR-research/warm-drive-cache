@@ -59,7 +59,7 @@ Whole multiples omit decimals (`1MiB (1048576 Bytes)`); other values use two dec
 Fractional values are **not allowed** — not a bare float (`12.5`) and not a unit string (`"1.5KiB"`). Use a whole coefficient (`1536`, `"2KiB"`). Optional spaces: `"64 KiB"`.
 
 ## Reporting
-The application reports the on-disk size of the **cache** directory before and after refresh using the formatter above. End-of-pair counters include **File contents read** and **Metadata-only** (not “1-byte reads”). The live status block shows a summary (directories / files / threads / errors / elapsed / local target) plus a boxed per-worker table (`Count`, compact size, `READ`/`ATTRIB`/`idle`, a ten-cell read progress bar, path shortened by stripping the sync root / `$HOME` then truncated to 40 characters). Each progress cell is 10% of the mount-file stream (empty `□`, filled `■`); idle and metadata-only rows stay empty. The whole live block, including the box, is erased when the pair finishes. Graceful stop: **Ctrl+C** or **q** (TTY) finishes in-flight workers and does not start new files.
+The application reports the on-disk size of the **cache** directory before and after refresh using the formatter above. End-of-pair counters include **File contents read** and **Metadata-only** (not “1-byte reads”). The live status block shows a summary (directories / files / threads / errors / elapsed / local target) plus a boxed per-worker table (`Count`, compact size, `READ`/`ATTRIB`/`idle`, a ten-cell read progress bar, path shortened by stripping the sync root / `$HOME` then truncated to 40 characters at the default width of 80). Extra columns from `walk.width` / `-w` / `--width` (hard-capped to 80–200; values below 80 become 80) lengthen only the Source filename field. Each progress cell is 10% of the mount-file stream (empty `□`, filled `■`); idle and metadata-only rows stay empty. The whole live block, including the box, is erased when the pair finishes. Graceful stop: **Ctrl+C** or **q** (TTY) finishes in-flight workers and does not start new files.
 
 ## Cache Maintenance
 Before removing cache content, the tool scans JSON entries below `<cache-dir>/vfsMeta/<remote>/`, where `<remote>` is the rclone identifier from the unit `ExecStart` (`accessit:` in `rclone mount accessit: /mount`). Combined with `--cache-dir`, content lives in `<cache-dir>/vfs/<remote>/` and metadata in `<cache-dir>/vfsMeta/<remote>/`. A native or string `Dirty` value of `true` (case-insensitive) means rclone has not finished saving the modified content to its source. The tool does not purge those trees while any such entry remains. It checks the local metadata again every 1,000 ms and prints the metadata filename plus an elapsed-seconds counter on every check. Other remotes that share the same `--cache-dir` are left untouched.
@@ -84,16 +84,17 @@ An example warm-drive-cache.json is provided. The README.md, all source comments
 | Option | Description |
 |--------|-------------|
 | `-?`, `-h`, `--help` | Brief usage, where `warm-drive-cache.json` must live, embedded `warm-drive-cache-example.json`, `max_file_size_bytes` specials, link to README. Help takes precedence over every other option and performs no file checks or modifications. |
-| `-j`, `--json` | Validate config layout; for each entry print **service name**, **sync directory**, **`--cache-dir` from the unit** (preferred), **current cache size**, and **systemd active/inactive (system or user)**. Second-highest priority. Accepts the same `-t` / `-s` / `-c` overrides as a normal run; `-v` / `-l` / `--dry-run` are rejected. |
+| `-j`, `--json` | Validate config layout; for each entry print **service name**, **sync directory**, **`--cache-dir` from the unit** (preferred), **current cache size**, and **systemd active/inactive (system or user)**. Second-highest priority. Accepts the same `-t` / `-s` / `-c` / `-w` overrides as a normal run; `-v` / `-l` / `--dry-run` are rejected. |
 | `-i`, `--information` | Product information only: `Codebase Version`, `Codebase release` date, AGPL-3.0-only, repo + https://xSAR.com.au (exits) |
 | `-t VALUE`, `--threads VALUE` | Override JSON worker count; validated in `1..=64`. Applies to a normal run and to `--json`. |
 | `-s VALUE`, `--size VALUE` | Override JSON maximum using the shared size parser (`-1`, `0`, or a positive whole size/unit). Applies to a normal run and to `--json`. |
 | `-c VALUE`, `--checksum VALUE` | Override checksum in either direction: `TRUE`/`YES`/`Y` or `FALSE`/`NO`/`N` (case-insensitive). Applies to a normal run and to `--json`. |
+| `-w VALUE`, `--width VALUE` | Override the threads-display width. Defaults to **80** characters if omitted. Values below 80 become 80; values above 200 become 200. Extra columns above 80 lengthen only the Source filename field. Applies to a normal run and to `--json`. |
 | `-v`, `--verbose` | On a normal run: print **Configuration** and full **Pre-flight checks** detail. Quiet is the default. |
 | `-l`, `--log` | Write a time-stamped CSV under `/tmp/warm-drive-cache-YYYYMMDD-HHMMSS.csv` (with a process-specific suffix if that name already exists) with columns **Service name**, **path**, **filename**, **size (bytes)**, **status** (`READ` or `ATTRIB`). The path is printed again after a blank line at program end. |
 | `--dry-run` | Simulate cache deletion only (no warm). Concurrency locks are still created and removed; cache content is unchanged. May be combined with `-v` / `-l`. |
 
-**Precedence when several flags are present:** `-?` / `-h` / `--help` → `-j` / `--json` → `-i` / `--information` → normal run. Help ignores every other argument and exits before configuration loading, path checks, lock creation, or cache modification. JSON validation loads and checks the configured JSON and paths, applies `-t` / `-s` / `-c` if present, and performs no maintenance. Duplicate flags are rejected.
+**Precedence when several flags are present:** `-?` / `-h` / `--help` → `-j` / `--json` → `-i` / `--information` → normal run. Help ignores every other argument and exits before configuration loading, path checks, lock creation, or cache modification. JSON validation loads and checks the configured JSON and paths, applies `-t` / `-s` / `-c` / `-w` if present, and performs no maintenance. Duplicate flags are rejected.
 
 Normal runs always print the startup identity banner (product of xSAR, licence, website, source). Use `-i` for the short product-information dump without loading config.
 
@@ -207,7 +208,7 @@ flowchart TD
 
 ## Configuration via `warm-drive-cache.json`
 
-Paths, ignore names, mount-wait timings, and walk policy come from a JSON file; there are no hardcoded paths in the source. After the file is loaded, `-t` / `--threads`, `-s` / `--size`, and `-c` / `--checksum` override `walk.max_threads`, `walk.max_file_size_bytes`, and `walk.checksum`.
+Paths, ignore names, mount-wait timings, and walk policy come from a JSON file; there are no hardcoded paths in the source. After the file is loaded, `-t` / `--threads`, `-s` / `--size`, `-c` / `--checksum`, and `-w` / `--width` override `walk.max_threads`, `walk.max_file_size_bytes`, `walk.checksum`, and `walk.width`.
 
 ### Location (in priority order)
 
@@ -271,6 +272,7 @@ Each element describes **one** mount to warm and the cache directory that may be
 | `min_file_size_bytes` | number or size string | `0` | Min size for File contents read when `max_file_size_bytes > 0`; `0` = no lower bound. Accepts bytes or unit strings (see **Size input**). Displayed with the shared IEC formatter. |
 | `max_file_size_bytes` | number or size string | `0` | **File contents read** policy (see special values). Accepts bytes or unit strings. |
 | `max_threads` | integer | `8` | Concurrent warm workers (`1`–`64`). |
+| `width` | integer | `80` | Nominal full width of the threads display block, in characters. Defaults to **80** if omitted. Values below 80 become 80; values above 200 become 200. Extra columns above 80 lengthen only the Source filename field. |
 
 `walk.checksum` accepts native JSON `true` and `false`, or a quoted, case-insensitive string: `"TRUE"`, `"YES"`, `"Y"`, `"FALSE"`, `"NO"`, or `"N"`. The command-line `-c` / `--checksum` option requires one of those text values so either direction can be selected explicitly.
 
@@ -337,7 +339,8 @@ Failures skip that pair; other pairs continue.
     "max_depth": null,
     "min_file_size_bytes": 0,
     "max_file_size_bytes": "64KiB",
-    "max_threads": 8
+    "max_threads": 8,
+    "width": 80
   },
   "ignore": {
     "names": [".git", ".svn", "node_modules", ".cache", "target", "__pycache__"]

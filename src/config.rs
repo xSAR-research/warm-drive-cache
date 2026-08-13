@@ -358,6 +358,12 @@ pub struct WalkOptions {
     /// Default 8. Must be in 1..=64. Spinner shows active/max during the walk.
     #[serde(default = "default_max_threads")]
     pub max_threads: usize,
+
+    /// Nominal threads-display width in characters. Default 80; values below 80
+    /// become 80 and values above 200 become 200. Extra columns above 80
+    /// lengthen only the Source filename field.
+    #[serde(default = "default_width")]
+    pub width: usize,
 }
 
 impl Default for WalkOptions {
@@ -368,6 +374,7 @@ impl Default for WalkOptions {
             min_file_size_bytes: default_min_file_size_bytes(),
             max_file_size_bytes: default_max_file_size_bytes(),
             max_threads: default_max_threads(),
+            width: default_width(),
         }
     }
 }
@@ -383,6 +390,27 @@ fn default_max_threads() -> usize {
 }
 fn default_checksum() -> bool {
     true
+}
+
+pub const DISPLAY_WIDTH_DEFAULT: usize = 80;
+pub const DISPLAY_WIDTH_MIN: usize = 80;
+pub const DISPLAY_WIDTH_MAX: usize = 200;
+
+fn default_width() -> usize {
+    DISPLAY_WIDTH_DEFAULT
+}
+
+/// Clamp a requested threads-display width into `80..=200`.
+pub fn clamp_display_width(n: usize) -> usize {
+    n.clamp(DISPLAY_WIDTH_MIN, DISPLAY_WIDTH_MAX)
+}
+
+/// Source-filename columns at a threads-display width.
+/// Width 80 uses 40 characters; each extra column above 80 adds one (160 at 200).
+pub const SOURCE_FILENAME_BASE_CHARS: usize = 40;
+
+pub fn source_filename_max_chars(width: usize) -> usize {
+    SOURCE_FILENAME_BASE_CHARS + clamp_display_width(width).saturating_sub(DISPLAY_WIDTH_DEFAULT)
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -479,8 +507,10 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config, String> {
     let contents = fs::read_to_string(path)
         .map_err(|e| format!("cannot read config {}: {}", path.display(), e))?;
 
-    let cfg: Config = serde_json::from_str(&contents)
+    let mut cfg: Config = serde_json::from_str(&contents)
         .map_err(|e| format!("invalid JSON in {}: {}", path.display(), e))?;
+
+    cfg.walk.width = clamp_display_width(cfg.walk.width);
 
     if cfg.mount_wait.retry_delays_secs.is_empty() {
         return Err(
@@ -623,6 +653,7 @@ mod tests {
         assert_eq!(c.walk.min_file_size_bytes, 0);
         assert_eq!(c.walk.max_file_size_bytes, 0);
         assert_eq!(c.walk.max_threads, 8);
+        assert_eq!(c.walk.width, DISPLAY_WIDTH_DEFAULT);
         assert!(c.ignore.names.is_empty());
         // mount_wait should have today's defaults via our Default impls
         assert_eq!(c.mount_wait.initial_secs, 3);
@@ -652,6 +683,7 @@ mod tests {
         assert_eq!(c.walk.min_file_size_bytes, 0);
         assert_eq!(c.walk.max_file_size_bytes, 5120);
         assert_eq!(c.walk.max_threads, 4);
+        assert_eq!(c.walk.width, DISPLAY_WIDTH_DEFAULT);
         assert_eq!(
             c.ignore.names,
             vec![".git".to_string(), "target".to_string()]
@@ -709,6 +741,60 @@ mod tests {
         assert_eq!(c.walk.min_file_size_bytes, 0);
         assert_eq!(c.walk.max_file_size_bytes, 0);
         assert_eq!(c.walk.max_threads, 8);
+        assert_eq!(c.walk.width, DISPLAY_WIDTH_DEFAULT);
+    }
+
+    #[test]
+    fn display_width_defaults_and_clamps() {
+        assert_eq!(clamp_display_width(0), DISPLAY_WIDTH_MIN);
+        assert_eq!(clamp_display_width(50), DISPLAY_WIDTH_MIN);
+        assert_eq!(clamp_display_width(80), 80);
+        assert_eq!(clamp_display_width(120), 120);
+        assert_eq!(clamp_display_width(200), DISPLAY_WIDTH_MAX);
+        assert_eq!(clamp_display_width(250), DISPLAY_WIDTH_MAX);
+        assert_eq!(source_filename_max_chars(50), SOURCE_FILENAME_BASE_CHARS);
+        assert_eq!(source_filename_max_chars(80), SOURCE_FILENAME_BASE_CHARS);
+        assert_eq!(source_filename_max_chars(120), 80);
+        assert_eq!(source_filename_max_chars(200), 160);
+        assert_eq!(source_filename_max_chars(999), 160);
+
+        let td = TempDir::new().expect("tempdir");
+        let p = td.path().join("warm-drive-cache.json");
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],"walk":{"width":50}}"#,
+            )
+            .unwrap();
+        }
+        let c = load_from_path(&p).expect("width below 80 clamps");
+        assert_eq!(c.walk.width, DISPLAY_WIDTH_MIN);
+        assert_eq!(
+            source_filename_max_chars(c.walk.width),
+            SOURCE_FILENAME_BASE_CHARS
+        );
+
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],"walk":{"width":250}}"#,
+            )
+            .unwrap();
+        }
+        let c = load_from_path(&p).expect("width above 200 clamps");
+        assert_eq!(c.walk.width, DISPLAY_WIDTH_MAX);
+        assert_eq!(source_filename_max_chars(c.walk.width), 160);
+
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],"walk":{"width":120}}"#,
+            )
+            .unwrap();
+        }
+        let c = load_from_path(&p).expect("in-range width kept");
+        assert_eq!(c.walk.width, 120);
+        assert_eq!(source_filename_max_chars(c.walk.width), 80);
     }
 
     #[test]

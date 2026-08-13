@@ -45,6 +45,7 @@ pub struct CliOverrides {
     pub threads: Option<usize>,
     pub size: Option<i64>,
     pub checksum: Option<bool>,
+    pub width: Option<usize>,
 }
 
 /// Result of early CLI flag handling (`-h` / `-i` / `-j` / overrides / normal run).
@@ -69,7 +70,7 @@ pub enum CliAction {
 /// Parse process arguments into a validated action and typed overrides.
 ///
 /// Help takes first priority. JSON validation is second and still accepts the
-/// same `-t`/`-s`/`-c` overrides as a normal run. Information is third and
+/// same `-t`/`-s`/`-c`/`-w` overrides as a normal run. Information is third and
 /// ignores every other argument. Otherwise, unknown, missing, malformed, and
 /// conflicting options are rejected.
 pub fn parse_cli_args<I, S>(args: I) -> Result<CliAction, String>
@@ -132,7 +133,7 @@ where
                 }
                 dry_run = true;
             }
-            "-t" | "--threads" | "-s" | "--size" | "-c" | "--checksum" => {
+            "-t" | "--threads" | "-s" | "--size" | "-c" | "--checksum" | "-w" | "--width" => {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| format!("missing value for {arg}"))?;
@@ -164,6 +165,15 @@ where
                             return Err("conflicting duplicate --size option".into());
                         }
                         overrides.size = Some(crate::config::parse_size_expr(value)?);
+                    }
+                    "-w" | "--width" => {
+                        if overrides.width.is_some() {
+                            return Err("conflicting duplicate --width option".into());
+                        }
+                        let n: usize = value
+                            .parse()
+                            .map_err(|_| format!("malformed integer for {arg}: {value:?}"))?;
+                        overrides.width = Some(crate::config::clamp_display_width(n));
                     }
                     _ => {
                         if overrides.checksum.is_some() {
@@ -226,6 +236,9 @@ pub fn print_help() {
     println!(
         "  -c, --checksum VALUE Override checksum (TRUE/YES/Y or FALSE/NO/N); also applies with --json"
     );
+    println!(
+        "  -w, --width VALUE    Threads display width (default 80; clamped to 80..=200); extra columns lengthen Source filename only"
+    );
     println!("  -v, --verbose       Show Configuration and Pre-flight checks detail");
     println!("  -l, --log           Write time-stamped CSV log under /tmp (READ/ATTRIB per file)");
     println!("      --dry-run       Simulate deletion/no warm; concurrency lock is still created");
@@ -237,7 +250,7 @@ pub fn print_help() {
     );
     println!("  absolute sync/cache paths and optional systemd unit names (system or --user).");
     println!(
-        "  CLI -t/-s/-c override the matching walk fields after JSON is loaded (including --json)."
+        "  CLI -t/-s/-c/-w override the matching walk fields after JSON is loaded (including --json)."
     );
     println!("  Checksum verification is ENABLED BY DEFAULT.");
     println!("  JSON checksum values: true/false or quoted TRUE/YES/Y/FALSE/NO/N.");
@@ -349,6 +362,10 @@ pub fn print_loaded_config(cfg: &Config) {
         cache_ops::format_max_file_size_limit(cfg.walk.max_file_size_bytes)
     );
     println!("   walk.max_threads: {}", cfg.walk.max_threads);
+    println!(
+        "   walk.width: {} (threads display; extra above 80 lengthens Source filename)",
+        cfg.walk.width
+    );
     println!(
         "   walk.checksum: {} (enabled by default)",
         cfg.walk.checksum

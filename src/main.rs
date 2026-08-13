@@ -70,6 +70,10 @@ fn apply_overrides(cfg: &mut config::Config, o: startup::CliOverrides) -> Result
     if let Some(v) = o.checksum {
         cfg.walk.checksum = v;
     }
+    if let Some(v) = o.width {
+        cfg.walk.width = config::clamp_display_width(v);
+    }
+    cfg.walk.width = config::clamp_display_width(cfg.walk.width);
     config::validate_effective(cfg)
 }
 

@@ -262,12 +262,13 @@ pub fn run_config_check(cfg: &Config) -> bool {
     println!("Schema version:  {}", cfg.version);
     println!("Path pairs:      {}", cfg.paths.len());
     println!(
-        "Walk:            max_depth={:?}  min_size={}  max_size={}  max_threads={} checksum={}",
+        "Walk:            max_depth={:?}  min_size={}  max_size={}  max_threads={} checksum={} width={}",
         cfg.walk.max_depth,
         cache_ops::format_bytes(cfg.walk.min_file_size_bytes),
         cache_ops::format_max_file_size_limit(cfg.walk.max_file_size_bytes),
         cfg.walk.max_threads,
-        cfg.walk.checksum
+        cfg.walk.checksum,
+        cfg.walk.width
     );
     println!("Ignore names:    {:?}", cfg.ignore.names);
     println!(

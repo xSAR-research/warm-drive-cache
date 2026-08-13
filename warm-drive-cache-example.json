@@ -17,7 +17,8 @@
     "max_depth": null,
     "min_file_size_bytes": 0,
     "max_file_size_bytes": "64KiB",
-    "max_threads": 8
+    "max_threads": 8,
+    "width": 80
   },
   "ignore": {
     "names": [".git", ".svn", "node_modules", ".cache", "target", "__pycache__"]

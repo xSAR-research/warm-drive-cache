@@ -2,7 +2,7 @@
 //!
 //! Directory listings stay on the walker thread; file open/read runs on a bounded pool.
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::resolver;
 use crate::verifier::{self, VerifyOutcome, WaitOptions};
 use crate::warm_log::WarmLog;
@@ -25,9 +25,9 @@ const STATUS_REFRESH: Duration = Duration::from_millis(80);
 /// Dense 8-dot Braille spinner (common CLI “finer” progress glyphs).
 const SPINNER_FRAMES: &[char] = &['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
 
-/// Maximum characters for the path shown on each worker status line (includes directories).
-/// Kept short so the boxed table (progress bar + borders) fits an 80-column terminal.
-pub const DISPLAY_PATH_MAX_CHARS: usize = 40;
+/// Maximum characters for Source filename at the default threads-display width (80).
+/// Extra columns from `walk.width` / `--width` above 80 lengthen only this field.
+pub const DISPLAY_PATH_MAX_CHARS: usize = config::SOURCE_FILENAME_BASE_CHARS;
 
 /// Truncate long paths for the live status line (show the tail — most useful part).
 pub fn truncate_display(s: &str, max_chars: usize) -> String {
@@ -90,8 +90,8 @@ fn format_bytes_compact(bytes: u64) -> String {
 }
 
 /// Strip obvious leading path details (sync root, `$HOME`), then truncate to
-/// [`DISPLAY_PATH_MAX_CHARS`]. Prefer the longest matching strip root.
-pub fn shorten_path_for_display(path: &Path, strip_roots: &[&Path]) -> String {
+/// `max_chars`. Prefer the longest matching strip root.
+pub fn shorten_path_for_display(path: &Path, strip_roots: &[&Path], max_chars: usize) -> String {
     let mut s = path.display().to_string();
 
     let mut best_prefix: Option<String> = None;
@@ -122,7 +122,7 @@ pub fn shorten_path_for_display(path: &Path, strip_roots: &[&Path]) -> String {
         s = format!("~{}", &s[home.len()..]);
     }
 
-    truncate_display(&s, DISPLAY_PATH_MAX_CHARS)
+    truncate_display(&s, max_chars)
 }
 
 /// Cells in the per-row READ progress bar (each cell is 10% of the file).
@@ -283,7 +283,7 @@ fn write_status(buf: &str) {
 
 /// Format one numbered worker line for the live status table.
 /// Example: `1        8.1KiB  READ    ■■□□□□□□□□  subdir/file.txt`
-fn format_thread_slot_line(index_1based: usize, slot: &ThreadSlotView) -> String {
+fn format_thread_slot_line(index_1based: usize, slot: &ThreadSlotView, path_max: usize) -> String {
     let bar = format_progress_bar(
         slot.bytes_done,
         slot.size,
@@ -294,12 +294,12 @@ fn format_thread_slot_line(index_1based: usize, slot: &ThreadSlotView) -> String
             format!("{index_1based:<5}  {:>8}  {:<6}  {bar}  —", "—", "idle")
         }
         ThreadWorkMode::ByteRead => {
-            let name = truncate_display(&slot.path, DISPLAY_PATH_MAX_CHARS);
+            let name = truncate_display(&slot.path, path_max);
             let sz = format_bytes_compact(slot.size);
             format!("{index_1based:<5}  {sz:>8}  {:<6}  {bar}  {name}", "READ")
         }
         ThreadWorkMode::AttrOnly => {
-            let name = truncate_display(&slot.path, DISPLAY_PATH_MAX_CHARS);
+            let name = truncate_display(&slot.path, path_max);
             let sz = format_bytes_compact(slot.size);
             // Outside size window: attributes-only (no File contents read).
             format!("{index_1based:<5}  {sz:>8}  {:<6}  {bar}  {name}", "ATTRIB")
@@ -332,6 +332,8 @@ pub struct WalkStatus {
     /// Warnings deferred until after [`WalkStatus::finish_line`] so they cannot
     /// desynchronize the live table cursor (and leave the box / summary behind).
     pub warnings: Vec<String>,
+    /// Source filename max characters: 40 at width 80, plus (`width` − 80).
+    path_max: usize,
 }
 
 impl WalkStatus {
@@ -341,6 +343,7 @@ impl WalkStatus {
         errors: usize,
         max_threads: usize,
         local_target: impl Into<String>,
+        width: usize,
     ) -> Self {
         let slots = Arc::new(Mutex::new(
             (0..max_threads).map(|_| ThreadSlotView::idle()).collect(),
@@ -361,6 +364,7 @@ impl WalkStatus {
             slots,
             rendered_lines: 0,
             warnings: Vec::new(),
+            path_max: config::source_filename_max_chars(width),
         }
     }
 
@@ -420,14 +424,15 @@ impl WalkStatus {
         let target_line = format!("    Local target: {target}");
 
         let max_thr = self.max_threads;
+        let path_max = self.path_max;
         let slot_lines: Vec<String> = match self.slots.lock() {
             Ok(slots) => slots
                 .iter()
                 .enumerate()
-                .map(|(i, s)| format_thread_slot_line(i + 1, s))
+                .map(|(i, s)| format_thread_slot_line(i + 1, s, path_max))
                 .collect(),
             Err(_) => (0..max_thr)
-                .map(|i| format_thread_slot_line(i + 1, &ThreadSlotView::idle()))
+                .map(|i| format_thread_slot_line(i + 1, &ThreadSlotView::idle(), path_max))
                 .collect(),
         };
 
@@ -668,8 +673,10 @@ pub fn warm_tree(
     let metadata_only = Arc::new(AtomicUsize::new(0));
     let pending = Arc::new(AtomicUsize::new(0));
 
-    let local_target = shorten_path_for_display(sync_path, &[]);
-    let mut status = WalkStatus::new(0, 0, 0, max_threads, local_target);
+    let path_max = config::source_filename_max_chars(cfg.walk.width);
+    // Local target is not the Source filename field; keep the 40-character base.
+    let local_target = shorten_path_for_display(sync_path, &[], DISPLAY_PATH_MAX_CHARS);
+    let mut status = WalkStatus::new(0, 0, 0, max_threads, local_target, cfg.walk.width);
     let slots = Arc::clone(&status.slots);
     let ignore_names: HashSet<&OsStr> = cfg.ignore.names.iter().map(OsStr::new).collect();
     let sync_root = sync_path.to_path_buf();
@@ -744,7 +751,7 @@ pub fn warm_tree(
                             };
 
                             let display_path =
-                                shorten_path_for_display(&path, &[sync_root.as_path()]);
+                                shorten_path_for_display(&path, &[sync_root.as_path()], path_max);
                             let slots_for_hook = Arc::clone(&slots);
                             let slots_for_progress = Arc::clone(&slots);
                             let seen_size = Cell::new(None::<u64>);
@@ -1029,6 +1036,7 @@ mod tests {
                 bytes_done: 8300,
                 path: "a".repeat(DISPLAY_PATH_MAX_CHARS),
             },
+            DISPLAY_PATH_MAX_CHARS,
         );
         let lines = vec![long, thread];
         let (out, n) = compose_status_redraw(0, &lines, 80, 24);
@@ -1080,13 +1088,14 @@ mod tests {
                 bytes_done: 4150,
                 path: "subdir/file.txt".into(),
             },
+            DISPLAY_PATH_MAX_CHARS,
         );
         let mut table = vec![thread_table_header()];
         table.extend((0..8).map(|i| {
             if i == 0 {
                 slot.clone()
             } else {
-                format_thread_slot_line(i + 1, &ThreadSlotView::idle())
+                format_thread_slot_line(i + 1, &ThreadSlotView::idle(), DISPLAY_PATH_MAX_CHARS)
             }
         }));
         let boxed = box_table_lines(&table, printable_columns(80));
@@ -1162,7 +1171,7 @@ mod tests {
 
     #[test]
     fn walkstatus_new_initializes_counters() {
-        let mut s = WalkStatus::new(3, 7, 1, 8, "~/Documents/Gdrive/AccessIT");
+        let mut s = WalkStatus::new(3, 7, 1, 8, "~/Documents/Gdrive/AccessIT", 80);
         let p = Path::new(".");
         s.render(p, true);
         assert_eq!(s.max_threads, 8);
@@ -1172,7 +1181,7 @@ mod tests {
 
     #[test]
     fn walkstatus_record_methods_increment_correctly() {
-        let mut s = WalkStatus::new(10, 20, 2, 4, "/tmp/mount");
+        let mut s = WalkStatus::new(10, 20, 2, 4, "/tmp/mount", 80);
         s.record_dir();
         s.record_error();
         s.render(Path::new("/tmp"), true);
@@ -1180,7 +1189,7 @@ mod tests {
 
     #[test]
     fn walkstatus_render_rate_and_frame_advances() {
-        let mut s = WalkStatus::new(0, 0, 0, 8, "~/mounts/project");
+        let mut s = WalkStatus::new(0, 0, 0, 8, "~/mounts/project", 80);
         let p = Path::new("some/long/path/for/display/truncation/test");
         s.render(p, true);
         s.render(p, false);
@@ -1214,7 +1223,7 @@ mod tests {
     #[test]
     fn format_thread_slot_line_modes() {
         let idle = ThreadSlotView::idle();
-        let idle_line = format_thread_slot_line(1, &idle);
+        let idle_line = format_thread_slot_line(1, &idle, DISPLAY_PATH_MAX_CHARS);
         assert!(idle_line.contains("idle"));
         assert!(idle_line.starts_with('1'));
 
@@ -1224,7 +1233,7 @@ mod tests {
             bytes_done: 50,
             path: "subdir/small.txt".into(),
         };
-        let read_line = format_thread_slot_line(2, &read);
+        let read_line = format_thread_slot_line(2, &read, DISPLAY_PATH_MAX_CHARS);
         assert!(read_line.starts_with('2'));
         assert!(read_line.contains("READ"));
         assert!(read_line.contains("subdir/small.txt"));
@@ -1236,7 +1245,7 @@ mod tests {
             bytes_done: 0,
             path: "big.bin".into(),
         };
-        let attr_line = format_thread_slot_line(3, &attr);
+        let attr_line = format_thread_slot_line(3, &attr, DISPLAY_PATH_MAX_CHARS);
         assert!(attr_line.starts_with('3'));
         assert!(attr_line.contains("ATTRIB"));
         assert!(attr_line.contains(&format_progress_bar(0, 0, false)));
@@ -1246,12 +1255,43 @@ mod tests {
     fn shorten_path_strips_root_and_respects_max_chars() {
         let root = Path::new("/mnt/sync");
         let full = Path::new("/mnt/sync/dir/file.txt");
-        assert_eq!(shorten_path_for_display(full, &[root]), "dir/file.txt");
+        assert_eq!(
+            shorten_path_for_display(full, &[root], DISPLAY_PATH_MAX_CHARS),
+            "dir/file.txt"
+        );
 
         let long = "a".repeat(DISPLAY_PATH_MAX_CHARS + 20);
         let long_path = root.join(&long);
-        let truncated = shorten_path_for_display(&long_path, &[root]);
+        let truncated = shorten_path_for_display(&long_path, &[root], DISPLAY_PATH_MAX_CHARS);
         assert!(truncated.chars().count() <= DISPLAY_PATH_MAX_CHARS);
+
+        let wide = config::source_filename_max_chars(120);
+        let wide_trunc = shorten_path_for_display(&long_path, &[root], wide);
+        assert_eq!(wide, 80);
+        assert!(wide_trunc.chars().count() <= wide);
+        assert!(wide_trunc.chars().count() > DISPLAY_PATH_MAX_CHARS);
+    }
+
+    #[test]
+    fn source_filename_grows_only_with_extra_width() {
+        let path = "x".repeat(200);
+        let slot = ThreadSlotView {
+            mode: ThreadWorkMode::ByteRead,
+            size: 1,
+            bytes_done: 1,
+            path: path.clone(),
+        };
+        let at_80 = format_thread_slot_line(1, &slot, config::source_filename_max_chars(80));
+        let at_120 = format_thread_slot_line(1, &slot, config::source_filename_max_chars(120));
+        let name_80 = at_80.rsplit("  ").next().unwrap();
+        let name_120 = at_120.rsplit("  ").next().unwrap();
+        assert_eq!(name_80.chars().count(), DISPLAY_PATH_MAX_CHARS);
+        assert_eq!(name_120.chars().count(), 80);
+        assert_eq!(
+            at_120.chars().count() - at_80.chars().count(),
+            40,
+            "only Source filename should grow with extra width"
+        );
     }
 
     #[test]
@@ -1411,6 +1451,7 @@ mod tests {
                 min_file_size_bytes: 0,
                 max_file_size_bytes: 50,
                 max_threads: 2,
+                width: 80,
             },
             ignore: crate::config::IgnoreOptions::default(),
             mount_wait: crate::config::MountWait::default(),

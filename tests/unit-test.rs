@@ -17,8 +17,10 @@ use warm_drive_cache::{
 fn sample_schema_and_checksum_default() {
     let c: Config = serde_json::from_str(include_str!("../warm-drive-cache-example.json")).unwrap();
     assert!(c.walk.checksum);
+    assert_eq!(c.walk.width, 80);
     let c: Config = serde_json::from_str(r#"{"paths":[{"sync":"/a","cache":"/b"}]}"#).unwrap();
-    assert!(c.walk.checksum)
+    assert!(c.walk.checksum);
+    assert_eq!(c.walk.width, 80);
 }
 #[test]
 fn booleans_all_cases() {
@@ -53,6 +55,7 @@ fn cli_validation_and_precedence() {
                 threads: Some(4),
                 size: None,
                 checksum: Some(false),
+                width: None,
             }
         }
     );
@@ -161,10 +164,16 @@ fn every_runtime_option_accepts_short_and_long_forms() {
         vec!["--checksum", "NO"],
         vec!["--json", "-t", "4"],
         vec!["--json", "--size", "1MiB"],
+        vec!["-w", "100"],
+        vec!["--width", "100"],
+        vec!["--json", "-w", "90"],
     ] {
         parse_cli_args(args).expect("documented short and long option must parse");
     }
     assert!(parse_cli_args(["-s", "1.5KiB"]).is_err());
+    assert!(parse_cli_args(["-w"]).is_err());
+    assert!(parse_cli_args(["-w", "abc"]).is_err());
+    assert!(parse_cli_args(["-w", "80", "--width", "100"]).is_err());
 
     let CliAction::Run { overrides, .. } =
         parse_cli_args(["-t", "4", "-s", "1MiB", "-c", "NO"]).unwrap()
@@ -174,6 +183,22 @@ fn every_runtime_option_accepts_short_and_long_forms() {
     assert_eq!(overrides.threads, Some(4));
     assert_eq!(overrides.size, Some(1024 * 1024));
     assert_eq!(overrides.checksum, Some(false));
+    assert_eq!(overrides.width, None);
+
+    let CliAction::Run { overrides, .. } = parse_cli_args(["-w", "50"]).unwrap() else {
+        panic!("width override should produce a run action");
+    };
+    assert_eq!(overrides.width, Some(80));
+
+    let CliAction::Run { overrides, .. } = parse_cli_args(["--width", "250"]).unwrap() else {
+        panic!("width override should produce a run action");
+    };
+    assert_eq!(overrides.width, Some(200));
+
+    let CliAction::Run { overrides, .. } = parse_cli_args(["--width", "120"]).unwrap() else {
+        panic!("width override should produce a run action");
+    };
+    assert_eq!(overrides.width, Some(120));
 }
 #[test]
 fn sizes() {
