@@ -24,8 +24,10 @@ mod cleanup;
 mod config;
 mod dirty_check;
 mod mount_wait;
+mod resolver;
 mod shutdown;
 mod startup;
+mod verifier;
 mod warm_log;
 mod worker;
 
@@ -224,9 +226,43 @@ fn run(dry_run: bool, verbose: bool, log: bool, overrides: startup::CliOverrides
             cache_ops::format_bytes(before)
         );
 
+        let service_name = pair
+            .service
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        let unit_layout = if service_name.is_empty() {
+            None
+        } else {
+            match cache_check::extract_rclone_layout_from_unit(service_name) {
+                Ok(layout) => Some(layout),
+                Err(e) => {
+                    eprintln!("   ⚠️  could not parse rclone remote from unit {service_name}: {e}");
+                    None
+                }
+            }
+        };
+        let vfs_remote = unit_layout.as_ref().map(|l| l.remote.as_str());
+        if let Some(remote) = vfs_remote {
+            println!("   rclone remote: {remote}");
+            println!(
+                "   VFS content:   {}",
+                resolver::vfs_content_dir(cache_path, remote.as_ref()).display()
+            );
+            println!(
+                "   VFS metadata:  {}",
+                resolver::vfs_meta_dir(cache_path, remote.as_ref()).display()
+            );
+        }
+
         if dry_run {
-            println!("   --dry-run enabled: simulating full deletion (no changes made)");
-            let _ = cache_ops::delete_dir_contents(cache_path, true);
+            println!("   --dry-run enabled: simulating deletion (no changes made)");
+            if let Some(remote) = vfs_remote {
+                let _ = cache_ops::delete_remote_trees(cache_path, remote, true);
+            } else {
+                let _ = cache_ops::delete_dir_contents(cache_path, true);
+            }
             println!(
                 "   After size (simulated, cache): {}",
                 cache_ops::format_bytes(0)
@@ -239,17 +275,29 @@ fn run(dry_run: bool, verbose: bool, log: bool, overrides: startup::CliOverrides
         }
 
         println!("   Checking rclone vfsMeta entries for unsaved files...");
-        if let Err(e) =
-            dirty_check::wait_until_clean(cache_path, cfg.mount_wait.max_wait_secs, &shutdown)
-        {
+        if let Err(e) = dirty_check::wait_until_clean_scoped(
+            cache_path,
+            cfg.mount_wait.max_wait_secs,
+            &shutdown,
+            vfs_remote,
+        ) {
             eprintln!("❌ Cache purge cancelled: {e}");
             fatal_error = true;
             break;
         }
         println!("   ✓ No Dirty=true rclone metadata entries remain.");
 
-        println!("   Performing complete deletion of all files and subdirectories in cache dir...");
-        let deleted = cache_ops::delete_dir_contents(cache_path, false);
+        let deleted = if let Some(remote) = vfs_remote {
+            println!(
+                "   Deleting VFS cache for remote {remote} (vfs/{remote} and vfsMeta/{remote})..."
+            );
+            cache_ops::delete_remote_trees(cache_path, remote, false)
+        } else {
+            println!(
+                "   Performing complete deletion of all files and subdirectories in cache dir..."
+            );
+            cache_ops::delete_dir_contents(cache_path, false)
+        };
         let after_delete = cache_ops::dir_size(cache_path);
         println!(
             "   After deletion size (cache): {} (deleted {})",
@@ -265,15 +313,19 @@ fn run(dry_run: bool, verbose: bool, log: bool, overrides: startup::CliOverrides
         );
         startup::print_mount_modification_warning();
         println!();
-        let service_name = pair
-            .service
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("");
-        let mut status =
-            worker::warm_tree(sync_path, &cfg, &shutdown, service_name, warm_log.as_ref());
+        let mut status = worker::warm_tree(
+            sync_path,
+            cache_path,
+            &cfg,
+            &shutdown,
+            service_name,
+            warm_log.as_ref(),
+            vfs_remote.map(std::ffi::OsStr::new),
+        );
         status.finish_line();
+        for msg in &status.warnings {
+            eprintln!("   ⚠️  {msg}");
+        }
 
         let after_warm = cache_ops::dir_size(cache_path);
         println!(

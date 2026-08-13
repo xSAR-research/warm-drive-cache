@@ -18,6 +18,8 @@ pub enum VerifyOutcome {
     DestinationChanged,
     SizeMismatch,
     ChecksumMismatch,
+    /// Reserved for access-layer classification; not produced by [`verify`] yet.
+    #[allow(dead_code)]
     RateLimited,
     IoError(String),
     Cancelled,
@@ -40,7 +42,11 @@ impl Default for WaitOptions {
 fn signature(m: &fs::Metadata) -> (u64, Option<SystemTime>) {
     (m.len(), m.modified().ok())
 }
-fn digest(path: &Path, cancel: &AtomicBool) -> io::Result<(u64, blake3::Hash)> {
+fn digest(
+    path: &Path,
+    cancel: &AtomicBool,
+    on_progress: Option<&dyn Fn(u64)>,
+) -> io::Result<(u64, blake3::Hash)> {
     let mut f = fs::File::open(path)?;
     let mut h = Hasher::new();
     let mut n = 0u64;
@@ -57,6 +63,9 @@ fn digest(path: &Path, cancel: &AtomicBool) -> io::Result<(u64, blake3::Hash)> {
         n = n
             .checked_add(got as u64)
             .ok_or_else(|| io::Error::other("byte count overflow"))?;
+        if let Some(cb) = on_progress {
+            cb(n);
+        }
     }
     Ok((n, h.finalize()))
 }
@@ -67,6 +76,7 @@ pub fn verify(
     content: bool,
     wait: WaitOptions,
     cancel: &AtomicBool,
+    on_progress: Option<&dyn Fn(u64)>,
 ) -> VerifyOutcome {
     if !content {
         return VerifyOutcome::AttributesOnly;
@@ -77,7 +87,7 @@ pub fn verify(
             return VerifyOutcome::IoError(format!("mount metadata {}: {e}", source.display()));
         }
     };
-    let (read, src_hash) = match digest(source, cancel) {
+    let (read, src_hash) = match digest(source, cancel, on_progress) {
         Ok(v) => v,
         Err(e) if e.kind() == io::ErrorKind::Interrupted => return VerifyOutcome::Cancelled,
         Err(e) => return VerifyOutcome::IoError(format!("mount read {}: {e}", source.display())),
@@ -88,10 +98,16 @@ pub fn verify(
             return VerifyOutcome::IoError(format!("mount metadata {}: {e}", source.display()));
         }
     };
-    if before.len() != read {
+    // Google Docs/Sheets and similar Drive objects often stat as 0 bytes. A
+    // read may also yield 0 (nothing exported) — rclone then never creates a
+    // VFS cache file. Waiting for dest.len()==0 times out after 30s.
+    if read == 0 {
+        return VerifyOutcome::ChecksumDisabled;
+    }
+    if after.len() != read {
         return VerifyOutcome::SizeMismatch;
     }
-    if signature(&before) != signature(&after) {
+    if before.len() != 0 && before.len() != read {
         return VerifyOutcome::SourceChanged;
     }
     let start = Instant::now();
@@ -102,7 +118,7 @@ pub fn verify(
             return VerifyOutcome::Cancelled;
         }
         match fs::metadata(dest) {
-            Ok(m) if m.is_file() && m.len() == before.len() => {
+            Ok(m) if m.is_file() && m.len() == read => {
                 let s = signature(&m);
                 if Some(s) == last {
                     stable += 1
@@ -128,7 +144,7 @@ pub fn verify(
     if !checksum {
         return VerifyOutcome::ChecksumDisabled;
     }
-    let (n, dh) = match digest(dest, cancel) {
+    let (n, dh) = match digest(dest, cancel, None) {
         Ok(v) => v,
         Err(e) if e.kind() == io::ErrorKind::Interrupted => return VerifyOutcome::Cancelled,
         Err(e) => return VerifyOutcome::IoError(format!("cache read {}: {e}", dest.display())),
@@ -137,7 +153,7 @@ pub fn verify(
         Ok(m) => m,
         Err(e) => return VerifyOutcome::IoError(format!("cache metadata {}: {e}", dest.display())),
     };
-    if dm.len() != n || n != before.len() {
+    if dm.len() != n || n != read {
         return VerifyOutcome::SizeMismatch;
     }
     if signature(&dm) != signature(&da) {

@@ -3,13 +3,17 @@
 //! Directory listings stay on the walker thread; file open/read runs on a bounded pool.
 
 use crate::config::Config;
+use crate::resolver;
+use crate::verifier::{self, VerifyOutcome, WaitOptions};
 use crate::warm_log::WarmLog;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -22,7 +26,8 @@ const STATUS_REFRESH: Duration = Duration::from_millis(80);
 const SPINNER_FRAMES: &[char] = &['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
 
 /// Maximum characters for the path shown on each worker status line (includes directories).
-pub const DISPLAY_PATH_MAX_CHARS: usize = 80;
+/// Kept short so the boxed table (progress bar + borders) fits an 80-column terminal.
+pub const DISPLAY_PATH_MAX_CHARS: usize = 40;
 
 /// Truncate long paths for the live status line (show the tail — most useful part).
 pub fn truncate_display(s: &str, max_chars: usize) -> String {
@@ -54,6 +59,8 @@ pub enum ThreadWorkMode {
 struct ThreadSlotView {
     mode: ThreadWorkMode,
     size: u64,
+    /// Bytes streamed so far on a READ (0 for idle / ATTRIB).
+    bytes_done: u64,
     /// Full path string; truncated at render time.
     path: String,
 }
@@ -63,6 +70,7 @@ impl ThreadSlotView {
         Self {
             mode: ThreadWorkMode::Idle,
             size: 0,
+            bytes_done: 0,
             path: String::new(),
         }
     }
@@ -117,27 +125,184 @@ pub fn shorten_path_for_display(path: &Path, strip_roots: &[&Path]) -> String {
     truncate_display(&s, DISPLAY_PATH_MAX_CHARS)
 }
 
-/// Column header for the live per-thread table.
-const THREAD_TABLE_HEADER: &str = "Count  Size      Action  Source filename";
-const THREAD_TABLE_RULE: &str = "------------------------------------------------------------------------------------------------------";
+/// Cells in the per-row READ progress bar (each cell is 10% of the file).
+const PROGRESS_CELLS: usize = 10;
+const PROGRESS_EMPTY: char = '□';
+const PROGRESS_FULL: char = '■';
+
+/// Ten-cell bar: empty for idle/ATTRIB; floor(done/total×10) filled squares on READ.
+/// A zero-length READ is shown as complete (nothing to stream).
+fn format_progress_bar(done: u64, total: u64, reading: bool) -> String {
+    if !reading {
+        return PROGRESS_EMPTY.to_string().repeat(PROGRESS_CELLS);
+    }
+    if total == 0 {
+        return PROGRESS_FULL.to_string().repeat(PROGRESS_CELLS);
+    }
+    let filled = done
+        .saturating_mul(PROGRESS_CELLS as u64)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(PROGRESS_CELLS as u64) as usize;
+    format!(
+        "{}{}",
+        PROGRESS_FULL.to_string().repeat(filled),
+        PROGRESS_EMPTY.to_string().repeat(PROGRESS_CELLS - filled)
+    )
+}
+
+fn thread_table_header() -> String {
+    format!(
+        "{:<5}  {:>8}  {:<6}  {:<10}  Source filename",
+        "Count", "Size", "Action", "Progress"
+    )
+}
+
+/// Wrap header + worker rows in a box of exactly `width` cells so the right
+/// border is not clipped (compose_status_redraw already limits to width-1).
+fn box_table_lines(inner_lines: &[String], width: usize) -> Vec<String> {
+    if width < 2 {
+        return inner_lines.to_vec();
+    }
+    let inner = width - 2;
+    let mut out = Vec::with_capacity(inner_lines.len() + 2);
+    out.push(format!("┌{}┐", "─".repeat(inner)));
+    for line in inner_lines {
+        let text_w = inner.saturating_sub(1);
+        let clipped = clip_to_columns(line, text_w);
+        let pad = text_w.saturating_sub(clipped.chars().count());
+        out.push(format!("│ {clipped}{}│", " ".repeat(pad)));
+    }
+    out.push(format!("└{}┘", "─".repeat(inner)));
+    out
+}
+
+/// Erase the current physical row (`EL 2`) and the viewport from the cursor down (`ED 0`).
+const CSI_ERASE_LINE: &str = "\x1b[2K";
+const CSI_ERASE_DOWN: &str = "\x1b[J";
+
+/// Columns we may write without triggering an automatic wrap.
+///
+/// A glyph placed in the last column makes many terminals advance to the next
+/// row (the “eat-newline” / last-column wrap). CSI CUU/CPL then under-counts
+/// physical rows and the next in-place redraw smears the table.
+fn printable_columns(term_cols: usize) -> usize {
+    term_cols.saturating_sub(1)
+}
+
+/// Truncate `s` to at most `max_cols` Unicode scalars (ASCII-width status text).
+fn clip_to_columns(s: &str, max_cols: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_cols {
+        s.to_string()
+    } else {
+        s.chars().take(max_cols).collect()
+    }
+}
+
+/// Visible `(columns, rows)` of stdout, or `COLUMNS`/`LINES`, or 80×24.
+fn stdout_size() -> (usize, usize) {
+    let fd = io::stdout().as_raw_fd();
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0;
+    let ioctl_cols = if ok { usize::from(ws.ws_col) } else { 0 };
+    let ioctl_rows = if ok { usize::from(ws.ws_row) } else { 0 };
+    let cols = if ioctl_cols > 0 {
+        ioctl_cols
+    } else {
+        env::var("COLUMNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| *v > 0)
+            .unwrap_or(80)
+    };
+    let rows = if ioctl_rows > 0 {
+        ioctl_rows
+    } else {
+        env::var("LINES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| *v > 0)
+            .unwrap_or(24)
+    };
+    (cols, rows)
+}
+
+/// In-place redraw of `lines`. `prev_rows` is how many physical rows the last
+/// frame occupied (cursor is on the line immediately below that block).
+///
+/// Each emitted row is clipped to `term_cols - 1` so it cannot wrap, and the
+/// block is clipped to `term_rows - 1` so the trailing newline cannot scroll
+/// the first row off-screen. Either wrap or scroll would desynchronize
+/// `\x1b[{n}F` from the real cursor location.
+fn compose_status_redraw(
+    prev_rows: usize,
+    lines: &[String],
+    term_cols: usize,
+    term_rows: usize,
+) -> (String, usize) {
+    let max_cols = printable_columns(term_cols);
+    let max_rows = term_rows.saturating_sub(1).max(1);
+    let rows: Vec<String> = lines
+        .iter()
+        .take(max_rows)
+        .map(|line| clip_to_columns(line, max_cols))
+        .collect();
+    let new_rows = rows.len();
+
+    let mut out = String::new();
+    if prev_rows > 0 {
+        // CPL: column 0 of the first row of the previous block (not CUU, which
+        // keeps the current column).
+        let _ = write!(out, "\x1b[{prev_rows}F");
+    }
+    for line in &rows {
+        let _ = writeln!(out, "{CSI_ERASE_LINE}{line}");
+    }
+    // Discard wrap remnants or leftover rows from a taller previous frame.
+    out.push_str(CSI_ERASE_DOWN);
+    (out, new_rows)
+}
+
+fn compose_status_clear(prev_rows: usize) -> String {
+    if prev_rows == 0 {
+        String::new()
+    } else {
+        format!("\x1b[{prev_rows}F{CSI_ERASE_DOWN}")
+    }
+}
+
+fn write_status(buf: &str) {
+    if buf.is_empty() {
+        return;
+    }
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(buf.as_bytes());
+    let _ = stdout.flush();
+}
 
 /// Format one numbered worker line for the live status table.
-/// Example: `1        8.1KiB  READ    subdir/file.txt`
+/// Example: `1        8.1KiB  READ    ■■□□□□□□□□  subdir/file.txt`
 fn format_thread_slot_line(index_1based: usize, slot: &ThreadSlotView) -> String {
+    let bar = format_progress_bar(
+        slot.bytes_done,
+        slot.size,
+        slot.mode == ThreadWorkMode::ByteRead,
+    );
     match slot.mode {
         ThreadWorkMode::Idle => {
-            format!("{index_1based:<5}  {:>8}  {:<6}  —", "—", "idle")
+            format!("{index_1based:<5}  {:>8}  {:<6}  {bar}  —", "—", "idle")
         }
         ThreadWorkMode::ByteRead => {
             let name = truncate_display(&slot.path, DISPLAY_PATH_MAX_CHARS);
             let sz = format_bytes_compact(slot.size);
-            format!("{index_1based:<5}  {sz:>8}  {:<6}  {name}", "READ")
+            format!("{index_1based:<5}  {sz:>8}  {:<6}  {bar}  {name}", "READ")
         }
         ThreadWorkMode::AttrOnly => {
             let name = truncate_display(&slot.path, DISPLAY_PATH_MAX_CHARS);
             let sz = format_bytes_compact(slot.size);
             // Outside size window: attributes-only (no File contents read).
-            format!("{index_1based:<5}  {sz:>8}  {:<6}  {name}", "ATTRIB")
+            format!("{index_1based:<5}  {sz:>8}  {:<6}  {bar}  {name}", "ATTRIB")
         }
     }
 }
@@ -162,8 +327,11 @@ pub struct WalkStatus {
     local_target: String,
     /// Shared with workers: current file / mode per thread index.
     slots: Arc<Mutex<Vec<ThreadSlotView>>>,
-    /// How many lines the last render wrote (for ANSI cursor-up redraw).
+    /// Physical rows the last render occupied (CSI CPL count for the next frame).
     rendered_lines: usize,
+    /// Warnings deferred until after [`WalkStatus::finish_line`] so they cannot
+    /// desynchronize the live table cursor (and leave the box / summary behind).
+    pub warnings: Vec<String>,
 }
 
 impl WalkStatus {
@@ -192,6 +360,7 @@ impl WalkStatus {
             local_target: local_target.into(),
             slots,
             rendered_lines: 0,
+            warnings: Vec::new(),
         }
     }
 
@@ -230,29 +399,25 @@ impl WalkStatus {
         let elapsed = self.started.elapsed().as_secs();
         let target = truncate_display(&self.local_target, 48);
 
-        let stop_note = if self.cancelled {
-            "  STOPPING (finish in-flight, no new work)"
-        } else {
-            ""
-        };
-
-        // Fixed multi-line layout (must match finish_line clear count):
+        // Fixed multi-line layout (each row must stay ≤ one physical terminal
+        // row after compose_status_redraw clips to width-1):
         // 1 Running:
-        // 2 spinner summary
-        // 3 blank
-        // 4 Running threads:
+        // 2 spinner + counters + elapsed
+        // 3 Local target
+        // 4 STOPPING (only when cancelled)
         // 5 blank
-        // 6 column header
-        // 7 rule
-        // 8.. thread rows
+        // 6 Running threads:
+        // 7 blank
+        // 8.. boxed table (top, header, worker rows, bottom)
         let summary = format!(
-            "{spinner}  Directories: {dirs:>6}  Files: {files:>6}  Threads: {active}/{max_thr}  Errors: {errs}  Elapsed time: {elapsed}s  Local target: {target}{stop_note}",
+            "{spinner}  Directories: {dirs:>6}  Files: {files:>6}  Threads: {active}/{max_thr}  Errors: {errs}  Elapsed: {elapsed}s",
             dirs = self.dirs,
             files = self.files,
             active = self.active_threads,
             max_thr = self.max_threads,
             errs = self.errors,
         );
+        let target_line = format!("    Local target: {target}");
 
         let max_thr = self.max_threads;
         let slot_lines: Vec<String> = match self.slots.lock() {
@@ -266,45 +431,36 @@ impl WalkStatus {
                 .collect(),
         };
 
-        // Re-draw the previous multi-line block in place (cursor up + clear each line).
-        if self.rendered_lines > 0 {
-            print!("\x1b[{}A", self.rendered_lines);
-        }
+        let (cols, rows) = stdout_size();
+        let table_width = printable_columns(cols).max(2);
+        let mut table = Vec::with_capacity(1 + slot_lines.len());
+        table.push(thread_table_header());
+        table.extend(slot_lines);
+        let boxed = box_table_lines(&table, table_width);
 
-        const LINE_PAD: usize = 200;
-        let mut lines: Vec<String> = Vec::with_capacity(7 + slot_lines.len());
+        let mut lines: Vec<String> = Vec::with_capacity(7 + boxed.len());
         lines.push("Running:".into());
         lines.push(summary);
+        lines.push(target_line);
+        if self.cancelled {
+            lines.push("STOPPING (finish in-flight, no new work)".into());
+        }
         lines.push(String::new());
         lines.push("Running threads:".into());
         lines.push(String::new());
-        lines.push(THREAD_TABLE_HEADER.into());
-        lines.push(THREAD_TABLE_RULE.into());
-        lines.extend(slot_lines);
+        lines.extend(boxed);
 
-        for line in &lines {
-            print!("\x1b[2K\r{:<LINE_PAD$}\n", line);
-        }
-
-        self.rendered_lines = lines.len();
-        let _ = io::stdout().flush();
+        let (frame, n) = compose_status_redraw(self.rendered_lines, &lines, cols, rows);
+        write_status(&frame);
+        self.rendered_lines = n;
     }
 
     /// Erase the live multi-line status block (header + per-worker lines) so
     /// completed services do not leave idle-thread clutter on the terminal.
     /// Subsequent summary lines print in its place.
     pub fn finish_line(&mut self) {
-        if self.rendered_lines > 0 {
-            // Cursor to first line of the block, then clear each row.
-            print!("\x1b[{}A", self.rendered_lines);
-            for _ in 0..self.rendered_lines {
-                print!("\x1b[2K\r\n");
-            }
-            // Return to the top of the cleared region for the next println!.
-            print!("\x1b[{}A", self.rendered_lines);
-            let _ = io::stdout().flush();
-            self.rendered_lines = 0;
-        }
+        write_status(&compose_status_clear(self.rendered_lines));
+        self.rendered_lines = 0;
     }
 }
 
@@ -358,22 +514,53 @@ fn log_warm_row(log: &WarmLog, service: &str, path: &Path, size: Option<u64>, st
     }
 }
 
+/// Local VFS cache to wait on (and optionally BLAKE3-compare) after a content read.
+pub struct WarmCache<'a> {
+    pub sync_root: &'a Path,
+    pub cache_root: &'a Path,
+    pub checksum: bool,
+    pub cancel: &'a AtomicBool,
+    /// Bytes streamed from the mount file so far (source digest only).
+    pub on_progress: Option<&'a dyn Fn(u64)>,
+    /// rclone remote name (`gdrive` in `gdrive:folder`) when the cache is shared.
+    pub vfs_remote: Option<&'a OsStr>,
+    /// Collect messages instead of printing during the live table.
+    pub warnings: Option<&'a Mutex<Vec<String>>>,
+}
+
+fn note_warning(cache: &WarmCache<'_>, msg: String) {
+    if let Some(buf) = cache.warnings
+        && let Ok(mut v) = buf.lock()
+    {
+        v.push(msg);
+    }
+}
+
 /// Warm one file: File contents read when size policy allows, otherwise attributes only.
 ///
 /// When `on_classified` is provided, it is called after size is known and before
 /// open/read so the live spinner can show path, size, and READ vs ATTR mode.
+///
+/// When `cache` is set, a content read streams the mount file, waits for the
+/// matching rclone VFS cache object, and BLAKE3-compares the two if
+/// `cache.checksum` is true. When checksum is false the full read and cache
+/// stability/size checks still run. `cache == None` streams the mount file only
+/// (size-policy unit tests).
 pub fn warm_file_with_hook(
     path: &Path,
     min: u64,
     max: i64,
     on_classified: Option<&dyn Fn(u64, ThreadWorkMode)>,
+    cache: Option<WarmCache<'_>>,
 ) -> WarmOutcome {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => return WarmOutcome::Error,
     };
     let len = meta.len();
-    let do_read = should_read_file_contents(len, min, max);
+    // Drive Docs/Sheets and similar objects often stat (and read) as 0 bytes.
+    // rclone then never writes a VFS cache file; treat them as metadata-only.
+    let do_read = len > 0 && should_read_file_contents(len, min, max);
     let mode = if do_read {
         ThreadWorkMode::ByteRead
     } else {
@@ -388,11 +575,42 @@ pub fn warm_file_with_hook(
         return WarmOutcome::MetadataOnly;
     }
 
+    if let Some(cache) = cache {
+        let dest = match resolver::resolve_for_remote(
+            cache.sync_root,
+            cache.cache_root,
+            path,
+            cache.vfs_remote,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                note_warning(&cache, format!("cache path {}: {e}", path.display()));
+                return WarmOutcome::Error;
+            }
+        };
+        return match verifier::verify(
+            path,
+            &dest,
+            cache.checksum,
+            true,
+            WaitOptions::default(),
+            cache.cancel,
+            cache.on_progress,
+        ) {
+            VerifyOutcome::Verified | VerifyOutcome::ChecksumDisabled => WarmOutcome::ByteRead,
+            VerifyOutcome::AttributesOnly => WarmOutcome::MetadataOnly,
+            VerifyOutcome::Cancelled => WarmOutcome::Error,
+            other => {
+                note_warning(&cache, format!("verify {}: {other:?}", path.display()));
+                WarmOutcome::Error
+            }
+        };
+    }
+
     match fs::File::open(path) {
         Ok(mut f) => {
             let mut buf = [0u8; 128 * 1024];
             let mut bytes = 0u64;
-            let mut hasher = blake3::Hasher::new();
             loop {
                 match f.read(&mut buf) {
                     Ok(0) => break,
@@ -401,7 +619,6 @@ pub fn warm_file_with_hook(
                             Some(v) => v,
                             None => return WarmOutcome::Error,
                         };
-                        hasher.update(&buf[..n]);
                     }
                     Err(e) => {
                         eprintln!("   ⚠️  mount read {}: {e}", path.display());
@@ -411,10 +628,7 @@ pub fn warm_file_with_hook(
             }
             // A complete stream is required to populate rclone VFS. Detect concurrent changes.
             match fs::symlink_metadata(path) {
-                Ok(after) if bytes == len && after.len() == len => {
-                    let _ = hasher.finalize();
-                    WarmOutcome::ByteRead
-                }
+                Ok(after) if bytes == len && after.len() == len => WarmOutcome::ByteRead,
                 _ => WarmOutcome::Error,
             }
         }
@@ -431,14 +645,17 @@ pub fn warm_file_with_hook(
 /// When `log` is set, each successful warm writes a CSV row (`READ` or `ATTRIB`).
 pub fn warm_tree(
     sync_path: &Path,
+    cache_path: &Path,
     cfg: &Config,
     shutdown: &Arc<AtomicBool>,
     service_name: &str,
     log: Option<&Arc<WarmLog>>,
+    vfs_remote: Option<&OsStr>,
 ) -> WalkStatus {
     let max_threads = cfg.walk.max_threads.max(1);
     let min_size = cfg.walk.min_file_size_bytes;
     let max_size = cfg.walk.max_file_size_bytes;
+    let checksum = cfg.walk.checksum;
     let channel_cap = max_threads.saturating_mul(4).max(4);
 
     let (tx, rx) = mpsc::sync_channel::<PathBuf>(channel_cap);
@@ -456,8 +673,11 @@ pub fn warm_tree(
     let slots = Arc::clone(&status.slots);
     let ignore_names: HashSet<&OsStr> = cfg.ignore.names.iter().map(OsStr::new).collect();
     let sync_root = sync_path.to_path_buf();
+    let cache_root = cache_path.to_path_buf();
     let service_name = service_name.to_string();
     let log = log.cloned();
+    let vfs_remote = vfs_remote.map(OsStr::to_os_string);
+    let warnings = Arc::new(Mutex::new(Vec::new()));
 
     thread::scope(|scope| {
         for worker_id in 0..max_threads {
@@ -471,8 +691,11 @@ pub fn warm_tree(
             let slots = Arc::clone(&slots);
             let shutdown = Arc::clone(shutdown);
             let sync_root = sync_root.clone();
+            let cache_root = cache_root.clone();
             let service_name = service_name.clone();
             let log = log.clone();
+            let vfs_remote = vfs_remote.clone();
+            let warnings = Arc::clone(&warnings);
 
             scope.spawn(move || {
                 loop {
@@ -523,6 +746,7 @@ pub fn warm_tree(
                             let display_path =
                                 shorten_path_for_display(&path, &[sync_root.as_path()]);
                             let slots_for_hook = Arc::clone(&slots);
+                            let slots_for_progress = Arc::clone(&slots);
                             let seen_size = Cell::new(None::<u64>);
                             let outcome = warm_file_with_hook(
                                 &path,
@@ -536,9 +760,25 @@ pub fn warm_tree(
                                         *slot = ThreadSlotView {
                                             mode,
                                             size,
+                                            bytes_done: 0,
                                             path: display_path.clone(),
                                         };
                                     }
+                                }),
+                                Some(WarmCache {
+                                    sync_root: sync_root.as_path(),
+                                    cache_root: cache_root.as_path(),
+                                    checksum,
+                                    cancel: &shutdown,
+                                    on_progress: Some(&|n| {
+                                        if let Ok(mut slots) = slots_for_progress.lock()
+                                            && let Some(slot) = slots.get_mut(worker_id)
+                                        {
+                                            slot.bytes_done = n;
+                                        }
+                                    }),
+                                    vfs_remote: vfs_remote.as_deref(),
+                                    warnings: Some(warnings.as_ref()),
                                 }),
                             );
                             match outcome {
@@ -672,6 +912,9 @@ pub fn warm_tree(
     });
 
     status.cancelled = shutdown.load(Ordering::SeqCst);
+    if let Ok(mut w) = warnings.lock() {
+        status.warnings = std::mem::take(&mut *w);
+    }
     status
 }
 /// Returns true if this entry should be skipped based on the ignore list.
@@ -728,6 +971,196 @@ mod tests {
     }
 
     #[test]
+    fn clip_to_columns_ascii_and_unicode() {
+        assert_eq!(clip_to_columns("abcd", 10), "abcd");
+        assert_eq!(clip_to_columns("abcd", 4), "abcd");
+        assert_eq!(clip_to_columns("abcd", 3), "abc");
+        assert_eq!(clip_to_columns("", 5), "");
+        assert_eq!(clip_to_columns("⣾  Directories", 1), "⣾");
+        assert_eq!(
+            clip_to_columns("x".repeat(200).as_str(), 79)
+                .chars()
+                .count(),
+            79
+        );
+    }
+
+    #[test]
+    fn printable_columns_leaves_last_cell_empty() {
+        assert_eq!(printable_columns(80), 79);
+        assert_eq!(printable_columns(1), 0);
+        assert_eq!(printable_columns(0), 0);
+    }
+
+    #[test]
+    fn compose_status_redraw_first_frame_does_not_move_cursor() {
+        let lines = vec!["Running:".into(), "summary".into(), "row".into()];
+        let (out, n) = compose_status_redraw(0, &lines, 80, 24);
+        assert_eq!(n, 3);
+        assert!(
+            !out.contains("F") && !out.contains("A"),
+            "first frame must not emit CUU/CPL: {out:?}"
+        );
+        assert!(out.contains(CSI_ERASE_LINE));
+        assert!(out.ends_with(CSI_ERASE_DOWN));
+    }
+
+    #[test]
+    fn compose_status_redraw_repositions_by_previous_physical_rows() {
+        let lines = vec!["Running:".into(), "summary".into(), "row".into()];
+        let (_, n1) = compose_status_redraw(0, &lines, 80, 24);
+        let (out, n2) = compose_status_redraw(n1, &lines, 80, 24);
+        assert_eq!(n1, 3);
+        assert_eq!(n2, 3);
+        assert!(
+            out.starts_with("\x1b[3F"),
+            "must CPL by the previous physical row count, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn compose_status_redraw_clips_so_no_row_can_wrap() {
+        let long = "x".repeat(200);
+        let thread = format_thread_slot_line(
+            1,
+            &ThreadSlotView {
+                mode: ThreadWorkMode::ByteRead,
+                size: 8300,
+                bytes_done: 8300,
+                path: "a".repeat(DISPLAY_PATH_MAX_CHARS),
+            },
+        );
+        let lines = vec![long, thread];
+        let (out, n) = compose_status_redraw(0, &lines, 80, 24);
+        assert_eq!(n, 2);
+        let max_cols = printable_columns(80);
+        let visible_rows = visible_rows_from_frame(&out);
+        assert_eq!(visible_rows.len(), 2);
+        for row in &visible_rows {
+            assert!(
+                row.chars().count() <= max_cols,
+                "row would wrap on 80-col terminal ({} cells): {row:?}",
+                row.chars().count()
+            );
+            assert!(
+                !row.contains(&" ".repeat(20)),
+                "must not space-pad rows (that was wrapping at 200 columns): {row:?}"
+            );
+        }
+        assert!(!out.contains(&"x".repeat(80)));
+        assert!(visible_rows[0].chars().all(|c| c == 'x'));
+        assert_eq!(visible_rows[0].chars().count(), max_cols);
+    }
+
+    #[test]
+    fn compose_status_redraw_caps_block_to_terminal_height() {
+        let lines: Vec<String> = (0..30).map(|i| format!("line-{i}")).collect();
+        let (out, n) = compose_status_redraw(0, &lines, 80, 10);
+        assert_eq!(
+            n, 9,
+            "must leave one row free so the last newline does not scroll"
+        );
+        let visible = visible_rows_from_frame(&out);
+        assert_eq!(visible.len(), 9);
+        assert_eq!(visible[0], "line-0");
+        assert_eq!(visible[8], "line-8");
+    }
+
+    #[test]
+    fn compose_status_redraw_realistic_table_stays_one_row_per_line() {
+        let summary = format!(
+            "{}  Directories: {:>6}  Files: {:>6}  Threads: 8/8  Errors: 0  Elapsed: 12s",
+            SPINNER_FRAMES[0], 1234, 5678
+        );
+        let slot = format_thread_slot_line(
+            1,
+            &ThreadSlotView {
+                mode: ThreadWorkMode::ByteRead,
+                size: 8300,
+                bytes_done: 4150,
+                path: "subdir/file.txt".into(),
+            },
+        );
+        let mut table = vec![thread_table_header()];
+        table.extend((0..8).map(|i| {
+            if i == 0 {
+                slot.clone()
+            } else {
+                format_thread_slot_line(i + 1, &ThreadSlotView::idle())
+            }
+        }));
+        let boxed = box_table_lines(&table, printable_columns(80));
+        let mut lines = vec![
+            "Running:".into(),
+            summary,
+            "    Local target: ~/mounts/project".into(),
+            String::new(),
+            "Running threads:".into(),
+            String::new(),
+        ];
+        lines.extend(boxed);
+        assert!(
+            lines[1].chars().count() <= 79,
+            "counter line must fit an 80-col terminal: {} cells",
+            lines[1].chars().count()
+        );
+        assert!(
+            lines[2].chars().count() <= 79,
+            "target line must fit an 80-col terminal: {} cells",
+            lines[2].chars().count()
+        );
+        assert_eq!(lines.len(), 17);
+        let (first, n1) = compose_status_redraw(0, &lines, 80, 24);
+        let (second, n2) = compose_status_redraw(n1, &lines, 80, 24);
+        assert_eq!(n1, 17);
+        assert_eq!(n2, 17);
+        assert!(second.starts_with("\x1b[17F"));
+        let framed = visible_rows_from_frame(&first);
+        assert!(framed[6].starts_with('┌') && framed[6].ends_with('┐'));
+        assert!(framed[16].starts_with('└') && framed[16].ends_with('┘'));
+        assert_eq!(framed[6].chars().count(), printable_columns(80));
+        let max_cols = printable_columns(80);
+        for row in visible_rows_from_frame(&first) {
+            assert!(row.chars().count() <= max_cols);
+        }
+    }
+
+    #[test]
+    fn compose_status_clear_returns_to_block_origin() {
+        assert_eq!(compose_status_clear(0), "");
+        assert_eq!(
+            compose_status_clear(15),
+            format!("\x1b[15F{CSI_ERASE_DOWN}")
+        );
+    }
+
+    fn visible_rows_from_frame(frame: &str) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut current = String::new();
+        let mut chars = frame.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if c == '\n' {
+                rows.push(std::mem::take(&mut current));
+                continue;
+            }
+            current.push(c);
+        }
+        // Trailing ED 0 leaves no extra row.
+        rows
+    }
+
+    #[test]
     fn walkstatus_new_initializes_counters() {
         let mut s = WalkStatus::new(3, 7, 1, 8, "~/Documents/Gdrive/AccessIT");
         let p = Path::new(".");
@@ -754,6 +1187,31 @@ mod tests {
     }
 
     #[test]
+    fn format_progress_bar_tenths() {
+        assert_eq!(format_progress_bar(0, 100, false), "□□□□□□□□□□");
+        assert_eq!(format_progress_bar(0, 100, true), "□□□□□□□□□□");
+        assert_eq!(format_progress_bar(9, 100, true), "□□□□□□□□□□");
+        assert_eq!(format_progress_bar(10, 100, true), "■□□□□□□□□□");
+        assert_eq!(format_progress_bar(50, 100, true), "■■■■■□□□□□");
+        assert_eq!(format_progress_bar(100, 100, true), "■■■■■■■■■■");
+        assert_eq!(format_progress_bar(0, 0, true), "■■■■■■■■■■");
+        assert_eq!(format_progress_bar(0, 1, false), "□□□□□□□□□□");
+    }
+
+    #[test]
+    fn box_table_lines_is_continuous_and_fixed_width() {
+        let inner = vec!["Count  Size".into(), "1      8B".into()];
+        let boxed = box_table_lines(&inner, 40);
+        assert_eq!(boxed.len(), 4);
+        assert!(boxed[0].starts_with('┌') && boxed[0].ends_with('┐'));
+        assert!(boxed[1].starts_with('│') && boxed[1].ends_with('│'));
+        assert!(boxed[3].starts_with('└') && boxed[3].ends_with('┘'));
+        for row in &boxed {
+            assert_eq!(row.chars().count(), 40);
+        }
+    }
+
+    #[test]
     fn format_thread_slot_line_modes() {
         let idle = ThreadSlotView::idle();
         let idle_line = format_thread_slot_line(1, &idle);
@@ -763,21 +1221,25 @@ mod tests {
         let read = ThreadSlotView {
             mode: ThreadWorkMode::ByteRead,
             size: 100,
+            bytes_done: 50,
             path: "subdir/small.txt".into(),
         };
         let read_line = format_thread_slot_line(2, &read);
         assert!(read_line.starts_with('2'));
         assert!(read_line.contains("READ"));
         assert!(read_line.contains("subdir/small.txt"));
+        assert!(read_line.contains(&format_progress_bar(50, 100, true)));
 
         let attr = ThreadSlotView {
             mode: ThreadWorkMode::AttrOnly,
             size: 5 * 1024 * 1024,
+            bytes_done: 0,
             path: "big.bin".into(),
         };
         let attr_line = format_thread_slot_line(3, &attr);
         assert!(attr_line.starts_with('3'));
         assert!(attr_line.contains("ATTRIB"));
+        assert!(attr_line.contains(&format_progress_bar(0, 0, false)));
     }
 
     #[test]
@@ -830,15 +1292,90 @@ mod tests {
             .write_all(&vec![0u8; 8192])
             .unwrap();
         assert_eq!(
-            warm_file_with_hook(&small, 0, 100, None),
+            warm_file_with_hook(&small, 0, 100, None, None),
             WarmOutcome::ByteRead
         );
         assert_eq!(
-            warm_file_with_hook(&large, 0, 100, None),
+            warm_file_with_hook(&large, 0, 100, None, None),
             WarmOutcome::MetadataOnly
         );
         assert_eq!(
-            warm_file_with_hook(&large, 0, 0, None),
+            warm_file_with_hook(&large, 0, 0, None, None),
+            WarmOutcome::ByteRead
+        );
+    }
+
+    #[test]
+    fn warm_file_honours_checksum_flag() {
+        let tmp = TempDir::new().expect("tempdir");
+        let sync = tmp.path().join("sync");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&sync).unwrap();
+        let src = sync.join("a.txt");
+        File::create(&src).unwrap().write_all(b"abc").unwrap();
+        let dest_dir = cache.join("vfs").join("remote");
+        fs::create_dir_all(&dest_dir).unwrap();
+        File::create(dest_dir.join("a.txt"))
+            .unwrap()
+            .write_all(b"abd")
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            warm_file_with_hook(
+                &src,
+                0,
+                0,
+                None,
+                Some(WarmCache {
+                    sync_root: &sync,
+                    cache_root: &cache,
+                    checksum: true,
+                    cancel: &cancel,
+                    on_progress: None,
+                    vfs_remote: None,
+                    warnings: None,
+                }),
+            ),
+            WarmOutcome::Error
+        );
+        assert_eq!(
+            warm_file_with_hook(
+                &src,
+                0,
+                0,
+                None,
+                Some(WarmCache {
+                    sync_root: &sync,
+                    cache_root: &cache,
+                    checksum: false,
+                    cancel: &cancel,
+                    on_progress: None,
+                    vfs_remote: None,
+                    warnings: None,
+                }),
+            ),
+            WarmOutcome::ByteRead
+        );
+        File::create(dest_dir.join("a.txt"))
+            .unwrap()
+            .write_all(b"abc")
+            .unwrap();
+        assert_eq!(
+            warm_file_with_hook(
+                &src,
+                0,
+                0,
+                None,
+                Some(WarmCache {
+                    sync_root: &sync,
+                    cache_root: &cache,
+                    checksum: true,
+                    cancel: &cancel,
+                    on_progress: None,
+                    vfs_remote: None,
+                    warnings: None,
+                }),
+            ),
             WarmOutcome::ByteRead
         );
     }
@@ -846,8 +1383,9 @@ mod tests {
     #[test]
     fn warm_tree_processes_mixed_files() {
         let tmp = TempDir::new().expect("tempdir");
-        let root = tmp.path();
-        fs::create_dir(root.join("sub")).unwrap();
+        let root = tmp.path().join("sync");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(root.join("sub")).unwrap();
         File::create(root.join("a.txt"))
             .unwrap()
             .write_all(b"hi")
@@ -855,6 +1393,13 @@ mod tests {
         File::create(root.join("sub").join("b.txt"))
             .unwrap()
             .write_all(&[1u8; 200])
+            .unwrap();
+        // rclone VFS layout for the content-read file (a.txt is 2 bytes, within max=50).
+        let vfs = cache.join("vfs").join("remote");
+        fs::create_dir_all(&vfs).unwrap();
+        File::create(vfs.join("a.txt"))
+            .unwrap()
+            .write_all(b"hi")
             .unwrap();
 
         let cfg = Config {
@@ -872,7 +1417,7 @@ mod tests {
         };
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        let status = warm_tree(root, &cfg, &shutdown, "", None);
+        let status = warm_tree(&root, &cache, &cfg, &shutdown, "", None, None);
         assert_eq!(status.files, 2);
         assert_eq!(status.byte_reads, 1);
         assert_eq!(status.metadata_only, 1);

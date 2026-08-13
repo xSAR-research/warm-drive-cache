@@ -58,8 +58,19 @@ pub fn parse_dirty_metadata(path: &Path) -> Result<Option<DirtyEntry>, String> {
         content_size,
     }))
 }
+#[allow(dead_code)] // public lib helper; the binary uses scan_scoped
 pub fn scan(cache: &Path) -> Result<Vec<DirtyEntry>, String> {
-    let root = cache.join("vfsMeta");
+    scan_scoped(cache, None)
+}
+
+/// Scan Dirty metadata. When `remote` is set, only `<cache>/vfsMeta/<remote>` is
+/// walked (the rclone remote from `rclone mount remote:`). Otherwise every
+/// service tree under `vfsMeta` is checked.
+pub fn scan_scoped(cache: &Path, remote: Option<&str>) -> Result<Vec<DirtyEntry>, String> {
+    let root = match remote {
+        Some(name) if !name.is_empty() => cache.join("vfsMeta").join(name),
+        _ => cache.join("vfsMeta"),
+    };
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -90,12 +101,28 @@ pub fn calculated_wait_secs(size: u64, configured_max: u64) -> u64 {
         by_size.min(configured_max)
     }
 }
+#[allow(dead_code)] // public lib helper; the binary uses wait_until_clean_scoped
 pub fn wait_until_clean(
     cache: &Path,
     configured_max: u64,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    wait_until_clean_with_interval(cache, configured_max, cancel, Duration::from_millis(1000))
+    wait_until_clean_scoped(cache, configured_max, cancel, None)
+}
+
+pub fn wait_until_clean_scoped(
+    cache: &Path,
+    configured_max: u64,
+    cancel: &AtomicBool,
+    remote: Option<&str>,
+) -> Result<(), String> {
+    wait_until_clean_with_interval(
+        cache,
+        configured_max,
+        cancel,
+        Duration::from_millis(1000),
+        remote,
+    )
 }
 
 /// Implementation with an injectable interval so synthetic tests can prove that a replacement
@@ -105,13 +132,14 @@ pub fn wait_until_clean_with_interval(
     configured_max: u64,
     cancel: &AtomicBool,
     poll_interval: Duration,
+    remote: Option<&str>,
 ) -> Result<(), String> {
     let mut first_seen = HashMap::<PathBuf, Instant>::new();
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Err("cancelled while waiting for dirty rclone metadata".into());
         }
-        let dirty = scan(cache)?;
+        let dirty = scan_scoped(cache, remote)?;
         if dirty.is_empty() {
             return Ok(());
         }

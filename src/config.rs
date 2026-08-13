@@ -3,8 +3,9 @@
 //! Load order: run-dir `warm-drive-cache.json` → `WARM_DRIVE_CACHE_CONFIG` → XDG config path.
 //! Public sample is tracked as `warm-drive-cache-example.json`; local `warm-drive-cache.json` is gitignored.
 //!
-//! Size fields accept JSON integers **or** strings with optional units
-//! (`64KiB`, `64K`, `1MB`, …). See [`parse_size_expr`].
+//! Size fields accept whole JSON integers **or** whole-number strings with
+//! optional units (`64KiB`, `64K`, `1MB`, …). Fractional values are rejected.
+//! See [`parse_size_expr`].
 //!
 //! See README for schema and examples. More xSAR tools: https://xSAR.com.au
 
@@ -59,16 +60,16 @@ fn deserialize_bool<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
 /// - `P` / `PB` / `PiB` → 1024⁵
 ///
 /// `B` and `b` are treated the same (bytes). Single-letter `K`/`M`/… omit the `B`.
-fn unit_multiplier(unit: &str) -> Result<f64, String> {
+fn unit_multiplier(unit: &str) -> Result<u64, String> {
     let u = unit.trim().to_ascii_lowercase();
     // Strip a trailing "ib" / "b" ambiguity by matching longest known forms first.
     let mult = match u.as_str() {
-        "" | "b" => 1.0,
-        "k" | "kb" | "kib" => 1024.0,
-        "m" | "mb" | "mib" => 1024.0 * 1024.0,
-        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
-        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "p" | "pb" | "pib" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024 * 1024 * 1024 * 1024,
+        "p" | "pb" | "pib" => 1024 * 1024 * 1024 * 1024 * 1024,
         _ => {
             return Err(format!(
                 "unknown size unit {unit:?} (use B, K/KB/KiB, M/MB/MiB, G/GB/GiB, T/TB/TiB, P/PB/PiB; \
@@ -82,11 +83,12 @@ fn unit_multiplier(unit: &str) -> Result<f64, String> {
 /// Parse a size expression into a signed byte count.
 ///
 /// Accepts:
-/// - bare integers: `65536`, `-1`
-/// - decimals with units: `1.5MiB`, `64k`
+/// - bare whole integers: `65536`, `-1`
+/// - whole coefficients with units: `64k`, `1MiB`
 /// - optional whitespace: `64 KiB`
 ///
-/// `-1` with no unit is the only allowed negative (metadata-only policy for max).
+/// Fractional values (`12.5`, `"1.5KiB"`) are rejected. `-1` with no unit is
+/// the only allowed negative (metadata-only policy for max).
 pub fn parse_size_expr(input: &str) -> Result<i64, String> {
     let s = input.trim();
     if s.is_empty() {
@@ -105,22 +107,24 @@ pub fn parse_size_expr(input: &str) -> Result<i64, String> {
         return Err(format!("invalid size expression {input:?}"));
     }
 
-    // Coefficient: digits and at most one '.'
+    // Coefficient: whole digits only (no decimal point).
     let bytes = body.as_bytes();
     let mut i = 0usize;
     let mut saw_digit = false;
-    let mut saw_dot = false;
     while i < bytes.len() {
         let c = bytes[i];
         if c.is_ascii_digit() {
             saw_digit = true;
             i += 1;
-        } else if c == b'.' && !saw_dot {
-            saw_dot = true;
-            i += 1;
         } else {
             break;
         }
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        return Err(format!(
+            "configuration error: size {input:?} must be a whole number of bytes \
+             (fractions are not allowed; use 1536 or \"2KiB\", not \"1.5KiB\")"
+        ));
     }
     if !saw_digit {
         return Err(format!(
@@ -131,13 +135,13 @@ pub fn parse_size_expr(input: &str) -> Result<i64, String> {
 
     let num_str = &body[..i];
     let unit = body[i..].trim();
-    let coef: f64 = num_str
+    let coef: u64 = num_str
         .parse()
         .map_err(|_| format!("configuration error: cannot parse numeric part of size {input:?}"))?;
 
     if negative {
         // Only exact -1 (no unit) is meaningful for max_file_size_bytes.
-        if (coef - 1.0).abs() < f64::EPSILON && unit.is_empty() {
+        if coef == 1 && unit.is_empty() {
             return Ok(-1);
         }
         return Err(format!(
@@ -147,19 +151,15 @@ pub fn parse_size_expr(input: &str) -> Result<i64, String> {
     }
 
     let mult = unit_multiplier(unit)?;
-    let product = coef * mult;
-    if !product.is_finite() || product < 0.0 {
-        return Err(format!(
-            "configuration error: size {input:?} is out of range"
-        ));
-    }
-    if product > i64::MAX as f64 {
+    let product = coef.checked_mul(mult).ok_or_else(|| {
+        format!("configuration error: size {input:?} exceeds maximum representable bytes")
+    })?;
+    if product > i64::MAX as u64 {
         return Err(format!(
             "configuration error: size {input:?} exceeds maximum representable bytes"
         ));
     }
-    // Round half away from zero for fractional coefficients (1.5KiB → 1536).
-    Ok(product.round() as i64)
+    Ok(product as i64)
 }
 
 /// Parse a non-negative size (for `min_file_size_bytes`).
@@ -206,9 +206,8 @@ where
             }
             if (v - v.round()).abs() > 1e-9 {
                 return Err(E::custom(format!(
-                    "configuration error: walk.min_file_size_bytes bare number must be a whole \
-                     byte count (got {v}); use a string with a unit for fractional values \
-                     (e.g. \"1.5KiB\")"
+                    "configuration error: walk.min_file_size_bytes must be a whole byte count \
+                     (got {v}); fractional values are not allowed"
                 )));
             }
             Ok(v.round() as u64)
@@ -260,9 +259,8 @@ where
             }
             if (v - v.round()).abs() > 1e-9 {
                 return Err(E::custom(format!(
-                    "configuration error: walk.max_file_size_bytes bare number must be a whole \
-                     byte count (got {v}); use a string with a unit for fractional values \
-                     (e.g. \"1.5MiB\"), or an integer special value (-1, 0, N)"
+                    "configuration error: walk.max_file_size_bytes must be a whole byte count \
+                     (got {v}); fractional values are not allowed"
                 )));
             }
             Ok(v.round() as i64)
@@ -481,12 +479,14 @@ pub fn load_from_path(path: &std::path::Path) -> Result<Config, String> {
     let contents = fs::read_to_string(path)
         .map_err(|e| format!("cannot read config {}: {}", path.display(), e))?;
 
-    let mut cfg: Config = serde_json::from_str(&contents)
+    let cfg: Config = serde_json::from_str(&contents)
         .map_err(|e| format!("invalid JSON in {}: {}", path.display(), e))?;
 
-    // Apply defaults for any omitted sections (serde default + our helpers already do most of it)
     if cfg.mount_wait.retry_delays_secs.is_empty() {
-        cfg.mount_wait.retry_delays_secs = default_retry_delays();
+        return Err(
+            "mount_wait.retry_delays_secs must not be empty (omit the field to use [3, 5, 8])"
+                .into(),
+        );
     }
 
     // Validation (strict but friendly)
@@ -800,10 +800,35 @@ mod tests {
         assert_eq!(parse_size_expr("1M").unwrap(), 1024 * 1024);
         assert_eq!(parse_size_expr("512B").unwrap(), 512);
         assert_eq!(parse_size_expr("512b").unwrap(), 512);
-        assert_eq!(parse_size_expr("1.5KiB").unwrap(), 1536);
         assert_eq!(parse_size_expr("-1").unwrap(), -1);
         assert!(parse_size_expr("-2").is_err());
         assert!(parse_size_expr("10XB").is_err());
+        for bad in ["1.5KiB", "12.5", "1.0MiB", ".5K"] {
+            let err = parse_size_expr(bad).unwrap_err();
+            assert!(
+                err.contains("whole number") || err.contains("fraction"),
+                "expected fraction rejection for {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_rejects_empty_retry_delays() {
+        let td = TempDir::new().expect("tempdir");
+        let p = td.path().join("warm-drive-cache.json");
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(
+                br#"{"paths":[{"sync":"/abs/one","cache":"/cache/abs"}],
+                 "mount_wait":{"retry_delays_secs":[]}}"#,
+            )
+            .unwrap();
+        }
+        let err = load_from_path(&p).unwrap_err();
+        assert!(
+            err.contains("retry_delays_secs"),
+            "expected empty retry list rejection: {err}"
+        );
     }
 
     #[test]

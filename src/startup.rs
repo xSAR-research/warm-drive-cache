@@ -17,7 +17,7 @@ pub const CODEBASE_VERSION: &str = PKG_VERSION;
 
 /// Codebase release date baked into the binary (universal short English form).
 /// Update this constant when cutting a release; not derived from the host clock.
-pub const CODEBASE_RELEASE: &str = "18th July, 2026";
+pub const CODEBASE_RELEASE: &str = "13th August, 2026";
 
 /// SPDX licence id from Cargo.toml (`license = "AGPL-3.0-only"`).
 pub const PKG_LICENSE: &str = env!("CARGO_PKG_LICENSE");
@@ -68,46 +68,70 @@ pub enum CliAction {
 
 /// Parse process arguments into a validated action and typed overrides.
 ///
-/// Help takes first priority and JSON validation second; either ignores every lower-priority
-/// argument. Otherwise, unknown, missing, malformed, and conflicting options are rejected.
+/// Help takes first priority. JSON validation is second and still accepts the
+/// same `-t`/`-s`/`-c` overrides as a normal run. Information is third and
+/// ignores every other argument. Otherwise, unknown, missing, malformed, and
+/// conflicting options are rejected.
 pub fn parse_cli_args<I, S>(args: I) -> Result<CliAction, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut dry_run = false;
-    let mut verbose = false;
-    let mut log = false;
-
     let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_owned()).collect();
-    let help = args
+    if args
         .iter()
-        .any(|a| matches!(a.as_str(), "-?" | "-h" | "--help"));
+        .any(|a| matches!(a.as_str(), "-?" | "-h" | "--help"))
+    {
+        return Ok(CliAction::Help);
+    }
+    let json = args.iter().any(|a| matches!(a.as_str(), "-j" | "--json"));
     let information = args
         .iter()
         .any(|a| matches!(a.as_str(), "-i" | "--information"));
-    if help {
-        return Ok(CliAction::Help);
-    }
-    if args.iter().any(|a| matches!(a.as_str(), "-j" | "--json")) {
-        return Ok(CliAction::JsonValidation {
-            overrides: CliOverrides::default(),
-        });
-    }
-    if information {
+    if information && !json {
         return Ok(CliAction::Information);
     }
+
+    let mut dry_run = false;
+    let mut verbose = false;
+    let mut log = false;
     let mut overrides = CliOverrides::default();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "-?" | "-h" | "--help" | "-i" | "--information" | "-j" | "--json" => {
-                unreachable!()
+            "-?" | "-h" | "--help" => unreachable!(),
+            "-i" | "--information" => {
+                // JSON validation outranks information; the flag is otherwise ignored.
             }
-            "-v" | "--verbose" => verbose = true,
-            "-l" | "--log" => log = true,
-            "--dry-run" => dry_run = true,
+            "-j" | "--json" => {}
+            "-v" | "--verbose" => {
+                if json {
+                    return Err(format!("option {arg} is not used with --json"));
+                }
+                if verbose {
+                    return Err("conflicting duplicate --verbose option".into());
+                }
+                verbose = true;
+            }
+            "-l" | "--log" => {
+                if json {
+                    return Err(format!("option {arg} is not used with --json"));
+                }
+                if log {
+                    return Err("conflicting duplicate --log option".into());
+                }
+                log = true;
+            }
+            "--dry-run" => {
+                if json {
+                    return Err(format!("option {arg} is not used with --json"));
+                }
+                if dry_run {
+                    return Err("conflicting duplicate --dry-run option".into());
+                }
+                dry_run = true;
+            }
             "-t" | "--threads" | "-s" | "--size" | "-c" | "--checksum" => {
                 let value = args
                     .get(i + 1)
@@ -155,6 +179,10 @@ where
         i += 1;
     }
 
+    if json {
+        return Ok(CliAction::JsonValidation { overrides });
+    }
+
     Ok(CliAction::Run {
         dry_run,
         verbose,
@@ -193,9 +221,11 @@ pub fn print_help() {
         "  -j, --json          Validate JSON, all configured paths, and service discoverability"
     );
     println!("  -i, --information   Show version, release date, licence, and project links");
-    println!("  -t, --threads VALUE Override worker count (1..=64)");
-    println!("  -s, --size VALUE    Override maximum: -1 attributes, 0 all, or positive size/unit");
-    println!("  -c, --checksum VALUE Override checksum (TRUE/YES/Y or FALSE/NO/N)");
+    println!("  -t, --threads VALUE Override worker count (1..=64); also applies with --json");
+    println!("  -s, --size VALUE    Override maximum: -1, 0, or a positive whole size/unit");
+    println!(
+        "  -c, --checksum VALUE Override checksum (TRUE/YES/Y or FALSE/NO/N); also applies with --json"
+    );
     println!("  -v, --verbose       Show Configuration and Pre-flight checks detail");
     println!("  -l, --log           Write time-stamped CSV log under /tmp (READ/ATTRIB per file)");
     println!("      --dry-run       Simulate deletion/no warm; concurrency lock is still created");
@@ -206,14 +236,15 @@ pub fn print_help() {
         "  Copy from warm-drive-cache-example.json (shipped with the binary/source) and set your"
     );
     println!("  absolute sync/cache paths and optional systemd unit names (system or --user).");
-    println!("  CLI values override JSON. Checksum verification is ENABLED BY DEFAULT.");
+    println!(
+        "  CLI -t/-s/-c override the matching walk fields after JSON is loaded (including --json)."
+    );
+    println!("  Checksum verification is ENABLED BY DEFAULT.");
     println!("  JSON checksum values: true/false or quoted TRUE/YES/Y/FALSE/NO/N.");
     println!(
         "  Full reads populate the cache; workers then poll the local VFS cache with a finite timeout."
     );
-    println!(
-        "  Before deletion, all vfsMeta services are checked every second for Dirty=true entries."
-    );
+    println!("  Before deletion, vfsMeta/<remote> is checked every second for Dirty=true entries.");
     println!(
         "  Normal runs create warm-drive-cache.lock in each cache; an existing lock defaults to No."
     );
@@ -223,9 +254,10 @@ pub fn print_help() {
     println!("   0  File contents read for every file (any size)");
     println!("  N>0 File contents read when file size is within min..N window");
     println!();
-    println!("Sizes may be JSON numbers (bytes) or strings with units (case-insensitive):");
+    println!("Sizes may be JSON numbers (whole bytes) or strings with units (case-insensitive):");
     println!("  65536 | \"64KiB\" | \"64K\" | \"64KB\" | \"1MiB\" | \"1M\" | \"512B\"");
     println!("  Units: B, K/KB/KiB, M/MB/MiB, G/GB/GiB, T/TB/TiB, P/PB/PiB (binary 1024).");
+    println!("  Fractional values are not allowed (not 12.5, not \"1.5KiB\").");
     println!();
     println!("Embedded warm-drive-cache-example.json template (save as warm-drive-cache.json):");
     println!("{CONFIG_EXAMPLE_JSON}");

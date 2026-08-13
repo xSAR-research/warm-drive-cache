@@ -12,6 +12,7 @@
 use crate::cache_ops;
 use crate::config::{Config, MountWait, PathPair};
 use crate::mount_wait;
+use crate::resolver;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -381,8 +382,15 @@ pub fn run_config_check(cfg: &Config) -> bool {
     all_ok
 }
 
-/// Read the unit definition (system or user) and extract the rclone `--cache-dir` path.
-pub fn extract_cache_dir_from_unit(unit: &str) -> Result<String, String> {
+/// rclone remote name plus optional `--cache-dir` from one unit file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RcloneUnitLayout {
+    /// `accessit` from `rclone mount accessit: /mount`.
+    pub remote: String,
+    pub cache_dir: Option<String>,
+}
+
+fn unit_definition_text(unit: &str) -> Result<String, String> {
     let scope = resolve_unit_scope(unit)?;
     let out = systemctl_output(scope, &["cat", unit])
         .map_err(|e| format!("systemctl {} cat {unit}: {e}", scope.label()))?;
@@ -399,8 +407,24 @@ pub fn extract_cache_dir_from_unit(unit: &str) -> Result<String, String> {
             scope.label()
         ));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Read the unit definition (system or user) and extract the rclone `--cache-dir` path.
+pub fn extract_cache_dir_from_unit(unit: &str) -> Result<String, String> {
+    let text = unit_definition_text(unit)?;
     parse_cache_dir_flag(&text).ok_or_else(|| format!("no --cache-dir found in unit {unit}"))
+}
+
+/// Parse `rclone mount <remote>:` and `--cache-dir` from the unit in one read.
+pub fn extract_rclone_layout_from_unit(unit: &str) -> Result<RcloneUnitLayout, String> {
+    let text = unit_definition_text(unit)?;
+    let remote = resolver::parse_rclone_remote_name(&text)
+        .ok_or_else(|| format!("no rclone remote: spec found in unit {unit}"))?;
+    Ok(RcloneUnitLayout {
+        remote,
+        cache_dir: parse_cache_dir_flag(&text),
+    })
 }
 
 /// Parse `--cache-dir PATH` or `--cache-dir=PATH` from unit / ExecStart text.
@@ -760,5 +784,39 @@ mod tests {
             Some("/home/user/.rclone_cache".into())
         );
         assert!(parse_cache_dir_flag("no flag here").is_none());
+    }
+
+    #[test]
+    fn parse_rclone_remote_from_execstart() {
+        assert_eq!(
+            resolver::parse_rclone_remote_name(
+                "ExecStart=/usr/bin/rclone mount --cache-dir /var/cache/r rem: /mnt"
+            )
+            .as_deref(),
+            Some("rem")
+        );
+        assert_eq!(
+            resolver::parse_rclone_remote_name(
+                "rclone mount --vfs-cache-mode full gdrive:Documents /home/user/mounts/x"
+            )
+            .as_deref(),
+            Some("gdrive")
+        );
+        assert_eq!(
+            resolver::parse_rclone_remote_name("rclone mount crypt: /mnt").as_deref(),
+            Some("crypt")
+        );
+        assert!(resolver::parse_rclone_remote_name("only --flags /abs/path").is_none());
+        let folded = "ExecStart=/usr/bin/rclone mount accessit: /home/user/mounts/project \\\n \
+             --vfs-cache-mode full \\\n \
+             --cache-dir /home/user/.cache/rclone \\";
+        assert_eq!(
+            resolver::parse_rclone_remote_name(folded).as_deref(),
+            Some("accessit")
+        );
+        assert_eq!(
+            parse_cache_dir_flag(folded).as_deref(),
+            Some("/home/user/.cache/rclone")
+        );
     }
 }

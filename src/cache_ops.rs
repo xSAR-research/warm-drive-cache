@@ -103,6 +103,32 @@ pub fn delete_dir_contents(path: &Path, dry_run: bool) -> u64 {
     deleted
 }
 
+/// Delete only `<cache>/vfs/<remote>` and `<cache>/vfsMeta/<remote>`.
+/// Other remotes that share `--cache-dir` are left intact. The lock file lives
+/// at the cache root and is never in these trees.
+pub fn delete_remote_trees(cache: &Path, remote: &str, dry_run: bool) -> u64 {
+    let mut deleted = 0u64;
+    for tree in [
+        crate::resolver::vfs_content_dir(cache, remote.as_ref()),
+        crate::resolver::vfs_meta_dir(cache, remote.as_ref()),
+    ] {
+        if !tree.exists() {
+            continue;
+        }
+        let sz = dir_size(&tree);
+        if dry_run {
+            println!("   Would delete: {}", tree.display());
+            deleted += sz;
+            continue;
+        }
+        if let Err(e) = fs::remove_dir_all(&tree) {
+            eprintln!("   Warning: failed to remove {}: {e}", tree.display());
+        }
+        deleted += sz;
+    }
+    deleted
+}
+
 #[cfg(test)]
 mod tests {
     use super::{format_bytes, format_max_file_size_limit};
