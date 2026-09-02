@@ -79,6 +79,8 @@ Do not modify, add, move, rename, or delete files in any configured rclone-mount
 ## Documentation & Secrets Policy
 An example warm-drive-cache.json is provided. The README.md, all source comments, and the example file contain no concrete local paths, usernames, or sensitive values. All references use generic placeholders (e.g. rclone://example-remote/example/path or /path/to/cache). Paths are classified as secrets.
 
+CSV logs contain real service names, filenames, source/cache paths, and error context. They are created with owner-only permissions (`0600` before any stricter umask), but remain in `/tmp` until removed or cleared by the system; treat them as sensitive and redact them before sharing. All text fields are quoted, and values that begin with a spreadsheet formula prefix (including after leading whitespace) are stored with a leading apostrophe.
+
 ## CLI options
 
 | Option | Description |
@@ -91,7 +93,7 @@ An example warm-drive-cache.json is provided. The README.md, all source comments
 | `-c VALUE`, `--checksum VALUE` | Override checksum in either direction: `TRUE`/`YES`/`Y` or `FALSE`/`NO`/`N` (case-insensitive). Applies to a normal run and to `--json`. |
 | `-w VALUE`, `--width VALUE` | Override the threads-display width. Defaults to **80** characters if omitted. Values below 80 become 80; values above 200 become 200. Extra columns above 80 lengthen only the Source filename field. Applies to a normal run and to `--json`. |
 | `-v`, `--verbose` | On a normal run: print **Configuration** and full **Pre-flight checks** detail. Quiet is the default. |
-| `-l`, `--log` | Write a time-stamped CSV under `/tmp/warm-drive-cache-YYYYMMDD-HHMMSS.csv` (with a process-specific suffix if that name already exists) with columns **Service name**, **path**, **filename**, **size (bytes)**, **status** (`READ` or `ATTRIB`). The path is printed again after a blank line at program end. |
+| `-l`, `--log` | Write a time-stamped, owner-only CSV under `/tmp/warm-drive-cache-YYYYMMDD-HHMMSS.csv` (with a process-specific suffix if that name already exists) with columns **Service name**, **path**, **filename**, **size (bytes)**, **status**, **error details**. Status is `READ`, `ATTRIB`, or `ERROR`; successful rows leave error details blank, and errors before metadata is available leave size blank. Warm and directory-traversal errors include actionable details. The path is printed again after a blank line at program end. |
 | `--dry-run` | Simulate cache deletion only (no warm). Concurrency locks are still created and removed; cache content is unchanged. May be combined with `-v` / `-l`. |
 
 **Precedence when several flags are present:** `-?` / `-h` / `--help` → `-j` / `--json` → `-i` / `--information` → normal run. Help ignores every other argument and exits before configuration loading, path checks, lock creation, or cache modification. JSON validation loads and checks the configured JSON and paths, applies `-t` / `-s` / `-c` / `-w` if present, and performs no maintenance. Duplicate flags are rejected.

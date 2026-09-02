@@ -351,20 +351,32 @@ fn run(dry_run: bool, verbose: bool, log: bool, overrides: startup::CliOverrides
     // Keep guard alive until here (Drop restores termios).
     drop(stdin_guard);
 
-    if let Some(ref log) = warm_log {
-        let _ = log.flush();
-    }
+    let log_flushed = if let Some(ref log) = warm_log {
+        match log.flush() {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("❌ warm-drive-cache log flush failed: {e}");
+                false
+            }
+        }
+    } else {
+        true
+    };
 
     cleanup::print_exit_summary(shutdown.load(Ordering::SeqCst));
 
     // After the normal exit summary: blank line then CSV path when logging was enabled.
     if let Some(ref log) = warm_log {
         println!();
-        println!("CSV log written to: {}", log.path().display());
+        if log_flushed {
+            println!("CSV log written to: {}", log.path().display());
+        } else {
+            println!("CSV log may be incomplete: {}", log.path().display());
+        }
     }
 
     // Lock removal is deliberately the final filesystem operation on a normal/graceful exit.
     drop(warm_log);
     drop(cache_locks);
-    !fatal_error
+    !fatal_error && log_flushed
 }

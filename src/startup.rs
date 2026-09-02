@@ -240,7 +240,9 @@ pub fn print_help() {
         "  -w, --width VALUE    Threads display width (default 80; clamped to 80..=200); extra columns lengthen Source filename only"
     );
     println!("  -v, --verbose       Show Configuration and Pre-flight checks detail");
-    println!("  -l, --log           Write time-stamped CSV log under /tmp (READ/ATTRIB per file)");
+    println!(
+        "  -l, --log           Write private CSV log under /tmp (READ/ATTRIB/ERROR with details)"
+    );
     println!("      --dry-run       Simulate deletion/no warm; concurrency lock is still created");
     println!();
     println!("Configuration:");

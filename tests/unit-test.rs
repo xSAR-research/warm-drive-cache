@@ -60,6 +60,8 @@ fn cli_validation_and_precedence() {
         }
     );
     assert!(parse_cli_args(["-v", "-v"]).is_err());
+    assert!(parse_cli_args(["-l", "--log"]).is_err());
+    assert!(parse_cli_args(["--json", "--log"]).is_err());
     assert!(parse_cli_args(["--dry-run", "--dry-run"]).is_err());
     assert_eq!(
         parse_cli_args(["--information", "-j"]).unwrap(),
@@ -164,6 +166,8 @@ fn every_runtime_option_accepts_short_and_long_forms() {
         vec!["--checksum", "NO"],
         vec!["--json", "-t", "4"],
         vec!["--json", "--size", "1MiB"],
+        vec!["-l"],
+        vec!["--log"],
         vec!["-w", "100"],
         vec!["--width", "100"],
         vec!["--json", "-w", "90"],
@@ -174,6 +178,13 @@ fn every_runtime_option_accepts_short_and_long_forms() {
     assert!(parse_cli_args(["-w"]).is_err());
     assert!(parse_cli_args(["-w", "abc"]).is_err());
     assert!(parse_cli_args(["-w", "80", "--width", "100"]).is_err());
+
+    for option in ["-l", "--log"] {
+        let CliAction::Run { log, .. } = parse_cli_args([option]).unwrap() else {
+            panic!("logging option should produce a run action");
+        };
+        assert!(log, "{option} must enable CSV logging");
+    }
 
     let CliAction::Run { overrides, .. } =
         parse_cli_args(["-t", "4", "-s", "1MiB", "-c", "NO"]).unwrap()

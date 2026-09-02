@@ -372,6 +372,7 @@ impl WalkStatus {
         self.dirs += 1;
     }
 
+    #[allow(dead_code)] // Public library API; warm_tree uses its shared atomic counter internally.
     pub fn record_error(&mut self) {
         self.errors += 1;
     }
@@ -471,6 +472,7 @@ impl WalkStatus {
 
 /// Outcome of warming a single file (File contents read vs attributes-only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Public library API; the binary uses the richer private worker result.
 pub enum WarmOutcome {
     ByteRead,
     MetadataOnly,
@@ -501,11 +503,7 @@ pub fn should_read_file_contents(len: u64, min: u64, max: i64) -> bool {
     true
 }
 
-/// Write one CSV row for a warmed file (best-effort; errors print a warning).
-fn log_warm_row(log: &WarmLog, service: &str, path: &Path, size: Option<u64>, status: &str) {
-    let Some(size) = size else {
-        return;
-    };
+fn log_path_fields(path: &Path) -> (String, String) {
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -514,8 +512,43 @@ fn log_warm_row(log: &WarmLog, service: &str, path: &Path, size: Option<u64>, st
         .parent()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    if let Err(e) = log.log_file(service, &dir, &filename, size, status) {
-        eprintln!("   ⚠️  warm log write failed for {}: {e}", path.display());
+    (dir, filename)
+}
+
+fn report_log_write_failure(log: &WarmLog) {
+    if let Some(error) = log.claim_failure_report() {
+        eprintln!("   ⚠️  warm log {error}");
+    }
+}
+
+/// Write one successful CSV row for a warmed file (best-effort).
+fn log_warm_success(log: &WarmLog, service: &str, path: &Path, size: u64, status: &str) {
+    let (dir, filename) = log_path_fields(path);
+    if log
+        .log_file(service, &dir, &filename, size, status)
+        .is_err()
+    {
+        report_log_write_failure(log);
+    }
+}
+
+/// Write one detailed CSV error row for a file (best-effort).
+fn log_warm_error(log: &WarmLog, service: &str, path: &Path, size: Option<u64>, details: &str) {
+    let (dir, filename) = log_path_fields(path);
+    if log
+        .log_error(service, &dir, &filename, size, details)
+        .is_err()
+    {
+        report_log_write_failure(log);
+    }
+}
+
+/// Write a traversal-level error. Its path names the affected traversal target,
+/// so the per-file filename and size fields remain blank.
+fn log_traversal_error(log: &WarmLog, service: &str, path: Option<&Path>, details: &str) {
+    let dir = path.map(|p| p.display().to_string()).unwrap_or_default();
+    if log.log_error(service, &dir, "", None, details).is_err() {
+        report_log_write_failure(log);
     }
 }
 
@@ -541,27 +574,28 @@ fn note_warning(cache: &WarmCache<'_>, msg: String) {
     }
 }
 
-/// Warm one file: File contents read when size policy allows, otherwise attributes only.
-///
-/// When `on_classified` is provided, it is called after size is known and before
-/// open/read so the live spinner can show path, size, and READ vs ATTR mode.
-///
-/// When `cache` is set, a content read streams the mount file, waits for the
-/// matching rclone VFS cache object, and BLAKE3-compares the two if
-/// `cache.checksum` is true. When checksum is false the full read and cache
-/// stability/size checks still run. `cache == None` streams the mount file only
-/// (size-policy unit tests).
-pub fn warm_file_with_hook(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WarmSuccess {
+    ByteRead(u64),
+    MetadataOnly(u64),
+}
+
+fn cache_failure(cache: &WarmCache<'_>, path: &Path, details: String) -> String {
+    note_warning(cache, format!("verify {}: {details}", path.display()));
+    details
+}
+
+/// Detailed implementation used by the tree worker. The public wrapper below
+/// deliberately preserves the exported `WarmOutcome` API.
+fn warm_file_detailed(
     path: &Path,
     min: u64,
     max: i64,
     on_classified: Option<&dyn Fn(u64, ThreadWorkMode)>,
     cache: Option<WarmCache<'_>>,
-) -> WarmOutcome {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => return WarmOutcome::Error,
-    };
+) -> Result<WarmSuccess, String> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|e| format!("source metadata {}: {e}", path.display()))?;
     let len = meta.len();
     // Drive Docs/Sheets and similar objects often stat (and read) as 0 bytes.
     // rclone then never writes a VFS cache file; treat them as metadata-only.
@@ -577,66 +611,148 @@ pub fn warm_file_with_hook(
 
     if !do_read {
         // Attributes already loaded via symlink_metadata — skip open/read for large blobs etc.
-        return WarmOutcome::MetadataOnly;
+        return Ok(WarmSuccess::MetadataOnly(len));
     }
 
     if let Some(cache) = cache {
-        let dest = match resolver::resolve_for_remote(
-            cache.sync_root,
-            cache.cache_root,
-            path,
-            cache.vfs_remote,
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                note_warning(&cache, format!("cache path {}: {e}", path.display()));
-                return WarmOutcome::Error;
-            }
-        };
-        return match verifier::verify(
+        let dest =
+            resolver::resolve_for_remote(cache.sync_root, cache.cache_root, path, cache.vfs_remote)
+                .map_err(|e| {
+                    let details = format!("cache path resolution: {e}");
+                    note_warning(&cache, format!("cache path {}: {e}", path.display()));
+                    details
+                })?;
+        let wait = WaitOptions::default();
+        let outcome = verifier::verify(
             path,
             &dest,
             cache.checksum,
             true,
-            WaitOptions::default(),
+            wait,
             cache.cancel,
             cache.on_progress,
-        ) {
-            VerifyOutcome::Verified | VerifyOutcome::ChecksumDisabled => WarmOutcome::ByteRead,
-            VerifyOutcome::AttributesOnly => WarmOutcome::MetadataOnly,
-            VerifyOutcome::Cancelled => WarmOutcome::Error,
-            other => {
-                note_warning(&cache, format!("verify {}: {other:?}", path.display()));
-                WarmOutcome::Error
+        );
+        return match outcome {
+            VerifyOutcome::Verified | VerifyOutcome::ChecksumDisabled => {
+                Ok(WarmSuccess::ByteRead(len))
             }
+            VerifyOutcome::AttributesOnly => Ok(WarmSuccess::MetadataOnly(len)),
+            VerifyOutcome::Cancelled => Err("cache verification cancelled".into()),
+            VerifyOutcome::CacheFileTimeout => Err(cache_failure(
+                &cache,
+                path,
+                format!(
+                    "cache verification timeout: {} did not appear at the expected size and remain stable within {}s",
+                    dest.display(),
+                    wait.timeout.as_secs()
+                ),
+            )),
+            VerifyOutcome::SourceChanged => Err(cache_failure(
+                &cache,
+                path,
+                format!("source changed while being read: {}", path.display()),
+            )),
+            VerifyOutcome::DestinationChanged => Err(cache_failure(
+                &cache,
+                path,
+                format!(
+                    "cache file changed while being verified: {}",
+                    dest.display()
+                ),
+            )),
+            VerifyOutcome::SizeMismatch => Err(cache_failure(
+                &cache,
+                path,
+                format!(
+                    "verification size mismatch while reading source or cache: source={}, cache destination={}",
+                    path.display(),
+                    dest.display()
+                ),
+            )),
+            VerifyOutcome::ChecksumMismatch => Err(cache_failure(
+                &cache,
+                path,
+                format!(
+                    "source/cache BLAKE3 checksum mismatch: source={}, cache={}",
+                    path.display(),
+                    dest.display()
+                ),
+            )),
+            VerifyOutcome::RateLimited => Err(cache_failure(
+                &cache,
+                path,
+                format!(
+                    "cache verification access was rate limited: {}",
+                    dest.display()
+                ),
+            )),
+            VerifyOutcome::IoError(details) => Err(cache_failure(
+                &cache,
+                path,
+                format!("cache verification I/O: {details}"),
+            )),
         };
     }
 
-    match fs::File::open(path) {
-        Ok(mut f) => {
-            let mut buf = [0u8; 128 * 1024];
-            let mut bytes = 0u64;
-            loop {
-                match f.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        bytes = match bytes.checked_add(n as u64) {
-                            Some(v) => v,
-                            None => return WarmOutcome::Error,
-                        };
-                    }
-                    Err(e) => {
-                        eprintln!("   ⚠️  mount read {}: {e}", path.display());
-                        return WarmOutcome::Error;
-                    }
-                }
+    let mut file =
+        fs::File::open(path).map_err(|e| format!("source open {}: {e}", path.display()))?;
+    let mut buf = [0u8; 128 * 1024];
+    let mut bytes = 0u64;
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes = bytes.checked_add(n as u64).ok_or_else(|| {
+                    format!("source read byte count overflow: {}", path.display())
+                })?;
             }
-            // A complete stream is required to populate rclone VFS. Detect concurrent changes.
-            match fs::symlink_metadata(path) {
-                Ok(after) if bytes == len && after.len() == len => WarmOutcome::ByteRead,
-                _ => WarmOutcome::Error,
+            Err(e) => {
+                eprintln!("   ⚠️  mount read {}: {e}", path.display());
+                return Err(format!("source read {}: {e}", path.display()));
             }
         }
+    }
+
+    // A complete stream is required to populate rclone VFS. Detect concurrent changes.
+    let after = fs::symlink_metadata(path)
+        .map_err(|e| format!("source metadata after read {}: {e}", path.display()))?;
+    if bytes != len {
+        return Err(format!(
+            "source read size mismatch: expected {len} bytes, read {bytes} bytes ({})",
+            path.display()
+        ));
+    }
+    if after.len() != len {
+        return Err(format!(
+            "source changed while being read: size was {len} bytes and is now {} bytes ({})",
+            after.len(),
+            path.display()
+        ));
+    }
+    Ok(WarmSuccess::ByteRead(len))
+}
+
+/// Warm one file: File contents read when size policy allows, otherwise attributes only.
+///
+/// When `on_classified` is provided, it is called after size is known and before
+/// open/read so the live spinner can show path, size, and READ vs ATTR mode.
+///
+/// When `cache` is set, a content read streams the mount file, waits for the
+/// matching rclone VFS cache object, and BLAKE3-compares the two if
+/// `cache.checksum` is true. When checksum is false the full read and cache
+/// stability/size checks still run. `cache == None` streams the mount file only
+/// (size-policy unit tests).
+#[allow(dead_code)] // Public library API and unit-test seam; warm_tree calls warm_file_detailed.
+pub fn warm_file_with_hook(
+    path: &Path,
+    min: u64,
+    max: i64,
+    on_classified: Option<&dyn Fn(u64, ThreadWorkMode)>,
+    cache: Option<WarmCache<'_>>,
+) -> WarmOutcome {
+    match warm_file_detailed(path, min, max, on_classified, cache) {
+        Ok(WarmSuccess::ByteRead(_)) => WarmOutcome::ByteRead,
+        Ok(WarmSuccess::MetadataOnly(_)) => WarmOutcome::MetadataOnly,
         Err(_) => WarmOutcome::Error,
     }
 }
@@ -647,7 +763,7 @@ pub fn warm_file_with_hook(
 /// On `shutdown` (SIGINT / `q`): stop enqueueing and discard queued work that has
 /// not started; in-flight workers finish their current file, then exit.
 ///
-/// When `log` is set, each successful warm writes a CSV row (`READ` or `ATTRIB`).
+/// When `log` is set, warm and traversal outcomes write CSV rows with detailed errors.
 pub fn warm_tree(
     sync_path: &Path,
     cache_path: &Path,
@@ -755,7 +871,7 @@ pub fn warm_tree(
                             let slots_for_hook = Arc::clone(&slots);
                             let slots_for_progress = Arc::clone(&slots);
                             let seen_size = Cell::new(None::<u64>);
-                            let outcome = warm_file_with_hook(
+                            let outcome = warm_file_detailed(
                                 &path,
                                 min_size,
                                 max_size,
@@ -789,32 +905,29 @@ pub fn warm_tree(
                                 }),
                             );
                             match outcome {
-                                WarmOutcome::ByteRead => {
+                                Ok(WarmSuccess::ByteRead(size)) => {
                                     byte_reads.fetch_add(1, Ordering::Relaxed);
                                     if let Some(ref log) = log {
-                                        log_warm_row(
-                                            log,
-                                            &service_name,
-                                            &path,
-                                            seen_size.get(),
-                                            "READ",
-                                        );
+                                        log_warm_success(log, &service_name, &path, size, "READ");
                                     }
                                 }
-                                WarmOutcome::MetadataOnly => {
+                                Ok(WarmSuccess::MetadataOnly(size)) => {
                                     metadata_only.fetch_add(1, Ordering::Relaxed);
                                     if let Some(ref log) = log {
-                                        log_warm_row(
+                                        log_warm_success(log, &service_name, &path, size, "ATTRIB");
+                                    }
+                                }
+                                Err(details) => {
+                                    errors.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(ref log) = log {
+                                        log_warm_error(
                                             log,
                                             &service_name,
                                             &path,
                                             seen_size.get(),
-                                            "ATTRIB",
+                                            &details,
                                         );
                                     }
-                                }
-                                WarmOutcome::Error => {
-                                    errors.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -823,6 +936,9 @@ pub fn warm_tree(
                 }
             });
         }
+        // Only workers should own receivers. If they all exit unexpectedly,
+        // try_send must report Disconnected instead of spinning forever on Full.
+        drop(rx);
 
         let mut walker = WalkDir::new(sync_path).follow_links(false);
         if let Some(depth) = cfg.walk.max_depth {
@@ -831,8 +947,10 @@ pub fn warm_tree(
         let walker = walker
             .into_iter()
             .filter_entry(|entry| !should_skip_entry(entry, &ignore_names));
+        let mut traversal_errors = 0usize;
+        let mut failed_directory_listings = HashSet::<PathBuf>::new();
 
-        for entry in walker {
+        'walk: for entry in walker {
             if shutdown.load(Ordering::SeqCst) {
                 status.cancelled = true;
                 break;
@@ -842,7 +960,22 @@ pub fn warm_tree(
                     let path = entry.path();
                     if entry.file_type().is_dir() {
                         status.record_dir();
-                        let _ = fs::read_dir(path);
+                        if let Err(e) = fs::read_dir(path) {
+                            failed_directory_listings.insert(path.to_path_buf());
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            traversal_errors += 1;
+                            let details = format!("directory listing {}: {e}", path.display());
+                            if let Some(ref log) = log {
+                                log_traversal_error(log, &service_name, Some(path), &details);
+                            }
+                            if traversal_errors.is_multiple_of(100) {
+                                status.finish_line();
+                                eprintln!(
+                                    "   ⚠️  Directory listing error at {}: {e}",
+                                    path.display()
+                                );
+                            }
+                        }
                     } else if entry.file_type().is_file() {
                         pending.fetch_add(1, Ordering::Relaxed);
                         // Back-pressure: blocks when the channel is full (workers busy).
@@ -871,8 +1004,19 @@ pub fn warm_tree(
                                 }
                                 Err(mpsc::TrySendError::Disconnected(_)) => {
                                     pending.fetch_sub(1, Ordering::Relaxed);
-                                    status.record_error();
-                                    break;
+                                    // No receiver remains, so queued work cannot drain.
+                                    pending.store(0, Ordering::Relaxed);
+                                    errors.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(ref log) = log {
+                                        log_warm_error(
+                                            log,
+                                            &service_name,
+                                            path,
+                                            None,
+                                            "worker queue disconnected before file dispatch",
+                                        );
+                                    }
+                                    break 'walk;
                                 }
                             }
                         }
@@ -885,13 +1029,25 @@ pub fn warm_tree(
                     status.render(path, false);
                 }
                 Err(e) => {
-                    status.record_error();
+                    // An explicit directory warm can fail before WalkDir reports
+                    // the same path; retain one error row/count for that failure.
+                    if e.path()
+                        .is_some_and(|path| failed_directory_listings.remove(path))
+                    {
+                        continue;
+                    }
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    traversal_errors += 1;
+                    let details = format!("directory traversal: {e}");
+                    if let Some(ref log) = log {
+                        log_traversal_error(log, &service_name, e.path(), &details);
+                    }
                     status.sync_worker_stats(&files, &errors, &active, &byte_reads, &metadata_only);
                     status.render(
                         e.path().unwrap_or_else(|| Path::new("<unknown>")),
-                        status.errors.is_multiple_of(10),
+                        traversal_errors.is_multiple_of(10),
                     );
-                    if status.errors.is_multiple_of(100) {
+                    if traversal_errors.is_multiple_of(100) {
                         status.finish_line();
                         let path_str = e
                             .path()
@@ -1346,6 +1502,21 @@ mod tests {
     }
 
     #[test]
+    fn warm_file_error_retains_source_metadata_detail() {
+        let tmp = TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("missing.txt");
+        let result = warm_file_detailed(&missing, 0, 0, None, None);
+        let details = result.expect_err("missing source must fail");
+        assert!(details.starts_with("source metadata "));
+        assert!(details.contains("missing.txt"));
+        assert!(!details.ends_with(':'));
+        assert_eq!(
+            warm_file_with_hook(&missing, 0, 0, None, None),
+            WarmOutcome::Error
+        );
+    }
+
+    #[test]
     fn warm_file_honours_checksum_flag() {
         let tmp = TempDir::new().expect("tempdir");
         let sync = tmp.path().join("sync");
@@ -1360,24 +1531,24 @@ mod tests {
             .write_all(b"abd")
             .unwrap();
         let cancel = AtomicBool::new(false);
-        assert_eq!(
-            warm_file_with_hook(
-                &src,
-                0,
-                0,
-                None,
-                Some(WarmCache {
-                    sync_root: &sync,
-                    cache_root: &cache,
-                    checksum: true,
-                    cancel: &cancel,
-                    on_progress: None,
-                    vfs_remote: None,
-                    warnings: None,
-                }),
-            ),
-            WarmOutcome::Error
-        );
+        let mismatch = warm_file_detailed(
+            &src,
+            0,
+            0,
+            None,
+            Some(WarmCache {
+                sync_root: &sync,
+                cache_root: &cache,
+                checksum: true,
+                cancel: &cancel,
+                on_progress: None,
+                vfs_remote: None,
+                warnings: None,
+            }),
+        )
+        .expect_err("different contents must fail checksum verification");
+        assert!(mismatch.contains("source/cache BLAKE3 checksum mismatch"));
+        assert!(mismatch.contains("a.txt"));
         assert_eq!(
             warm_file_with_hook(
                 &src,
@@ -1458,12 +1629,132 @@ mod tests {
         };
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        let status = warm_tree(&root, &cache, &cfg, &shutdown, "", None, None);
+        let log = Arc::new(WarmLog::create().expect("create log"));
+        let log_path = log.path().to_path_buf();
+        let mut status = warm_tree(
+            &root,
+            &cache,
+            &cfg,
+            &shutdown,
+            "demo.service",
+            Some(&log),
+            None,
+        );
+        status.finish_line();
+        log.flush().unwrap();
         assert_eq!(status.files, 2);
         assert_eq!(status.byte_reads, 1);
         assert_eq!(status.metadata_only, 1);
         assert_eq!(status.errors, 0);
         assert!(!status.cancelled);
         assert!(status.dirs >= 1);
+        let text = fs::read_to_string(&log_path).unwrap();
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.starts_with("\"demo.service\",")
+            && row.ends_with(",\"a.txt\",2,\"READ\",\"\"")));
+        assert!(rows.iter().any(|row| {
+            row.starts_with("\"demo.service\",") && row.ends_with(",\"b.txt\",200,\"ATTRIB\",\"\"")
+        }));
+        let _ = fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn warm_tree_logs_resolver_error_with_known_size() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().join("sync");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        File::create(root.join("a.txt"))
+            .unwrap()
+            .write_all(b"abc")
+            .unwrap();
+
+        let cfg = Config {
+            version: 1,
+            paths: vec![],
+            walk: crate::config::WalkOptions {
+                checksum: true,
+                max_depth: None,
+                min_file_size_bytes: 0,
+                max_file_size_bytes: 0,
+                max_threads: 1,
+                width: 80,
+            },
+            ignore: crate::config::IgnoreOptions::default(),
+            mount_wait: crate::config::MountWait::default(),
+        };
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(WarmLog::create().expect("create log"));
+        let log_path = log.path().to_path_buf();
+        let mut status = warm_tree(
+            &root,
+            &cache,
+            &cfg,
+            &shutdown,
+            "demo.service",
+            Some(&log),
+            None,
+        );
+        status.finish_line();
+        log.flush().unwrap();
+
+        assert_eq!(status.files, 1);
+        assert_eq!(status.errors, 1);
+        assert_eq!(status.byte_reads, 0);
+        assert_eq!(status.metadata_only, 0);
+        let text = fs::read_to_string(&log_path).unwrap();
+        assert!(text.contains("\"demo.service\","));
+        assert!(text.contains(",\"a.txt\",3,\"ERROR\","));
+        assert!(text.contains("cache path resolution:"));
+        assert_eq!(text.matches(",\"ERROR\",").count(), status.errors);
+        let _ = fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn warm_tree_retains_and_logs_traversal_error_count() {
+        let tmp = TempDir::new().expect("tempdir");
+        let missing_root = tmp.path().join("missing-sync-root");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let cfg = Config {
+            version: 1,
+            paths: vec![],
+            walk: crate::config::WalkOptions {
+                checksum: true,
+                max_depth: None,
+                min_file_size_bytes: 0,
+                max_file_size_bytes: 0,
+                max_threads: 1,
+                width: 80,
+            },
+            ignore: crate::config::IgnoreOptions::default(),
+            mount_wait: crate::config::MountWait::default(),
+        };
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(WarmLog::create().expect("create log"));
+        let log_path = log.path().to_path_buf();
+        let mut status = warm_tree(
+            &missing_root,
+            &cache,
+            &cfg,
+            &shutdown,
+            "demo.service",
+            Some(&log),
+            None,
+        );
+        status.finish_line();
+        log.flush().unwrap();
+
+        assert_eq!(status.files, 0);
+        assert_eq!(status.errors, 1);
+        let text = fs::read_to_string(&log_path).unwrap();
+        assert!(text.contains("\"demo.service\","));
+        assert!(text.contains(",\"\",,\"ERROR\",\"directory traversal:"));
+        assert_eq!(text.matches(",\"ERROR\",").count(), status.errors);
+        let _ = fs::remove_file(log_path);
     }
 }
